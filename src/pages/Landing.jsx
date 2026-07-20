@@ -59,6 +59,7 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       <div className="relative z-10 flex min-h-screen flex-col items-center justify-center px-5 py-16">
 
         {/* Badge */}
+                <a href="https://builtbyindies.com/products/mindflow" target="_blank"><img src="https://images.builtbyindies.com/badges/winner-week-01-builtbyindies.svg" alt="#1 Product of the Week" width="250" /></a>
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
           className="mb-6 flex items-center gap-2 rounded-full border border-umber-200 bg-white/80 px-4 py-1.5 font-sans text-xs font-medium text-umber-600 shadow-card backdrop-blur">
           🧠 Upload docs or import a GitHub repo — get a visual mental model instantly
