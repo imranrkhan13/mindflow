@@ -276,8 +276,8 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
         <p className="mt-5 max-w-lg text-center text-[11px] leading-relaxed text-umber-500">
           Repository imports index all supported source at a pinned commit.
           Uploads use the supplied document only. Answers can make mistakes.
-          Snapshots expire after 7 days or a backend rebuild. Videos animate
-          source diagrams, not cinematic model-generated footage.
+          Snapshots expire after 7 days or a backend rebuild. Choose narrated
+          source diagrams or experimental AI visual clips in the Video tab.
         </p>
         {/* Recent public projects */}
         {recent.length > 0 && (
@@ -345,4 +345,4 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       </div>
     </div>
   );
-                    }
+}
