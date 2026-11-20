@@ -1,0 +1,32 @@
+# Mindflow / Code
+
+Explore a public GitHub repository through code search, source-linked answers and a clickable import map. Documentation mode remains at `/docs`.
+
+## How it works
+
+1. The backend pins the default branch to a commit and downloads that repository archive.
+2. Every supported UTF-8 source, test, config and documentation file is indexed, with no per-file truncation. Excluded files and reasons are visible in Coverage.
+3. Each question searches the full indexed snapshot using identifier-aware lexical retrieval. Relevant source excerpts, not the entire repository, go to the model.
+4. Answers stream from a fixed, zero-priced `openrouter/free` route. Model IDs cannot be selected by callers. The backend checks the provider catalog's prompt and completion prices before generation. There is no paid fallback.
+5. Source IDs point to exact line ranges in the pinned commit. The model is instructed to cite claims and acknowledge missing evidence. Citation IDs are validated, but this is not a proof that every generated statement is correct.
+6. The graph shows static imports detected with Python AST parsing and JS/TS import matching. Clicking a node opens the actual file. It is not an observed runtime trace or a generated call-chain claim.
+
+## Honest boundaries
+
+- Public repositories only. No token is attached to imports. No source code is executed.
+- Repository root URLs only. Default branch snapshot, no automatic commit watching.
+- Generated directories, dependencies, lockfiles, assets, likely credential files, binary and non-UTF-8 files are excluded and listed. Symlinks are not followed. Git history and submodule contents are not imported.
+- Repositories exceeding 25 MB compressed / 100 MB expanded, 2,500 supported files, 12 MB indexed text or 500 KB per supported file are rejected rather than silently reduced. Up to 20,000 archive entries are inspected.
+- The model sees at most 16 relevant source excerpts. Oversized/minified windows remain in the file browser but may not fit the model context. Retrieval can miss relevant evidence, especially across languages, aliases or dynamic imports.
+- Follow-ups should name the function or feature. Each question is a fresh search, not a persistent conversation memory.
+- Free model capacity is shared and rate-limited. Key validation is not a guarantee that the next generation succeeds. Failure never switches to a paid route.
+- Free model providers receive retrieved public source excerpts. Do not paste private code or secrets into questions.
+- Snapshot cache is disposable, capped at 20 projects and seven days, and may be lost on a backend rebuild. This is demo hosting, not durable storage.
+
+## Development
+
+Frontend: React 18, Vite, React Flow. `npm ci && npm run dev`.
+
+Existing FastAPI backend: `https://huggingface.co/spaces/phineas8/mindflow-backend`. Set `VITE_API_URL` to its application origin in production. Local Vite proxies `/api` to port 8000.
+
+New API namespace: `/api/repository`. Import, snapshot coverage, exact source file, search-only, provider status and streamed ask endpoints are separate from legacy documentation endpoints.
