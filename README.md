@@ -30,3 +30,12 @@ Frontend: React 18, Vite, React Flow. `npm ci && npm run dev`.
 Existing FastAPI backend: `https://huggingface.co/spaces/phineas8/mindflow-backend`. Set `VITE_API_URL` to its application origin in production. Local Vite proxies `/api` to port 8000.
 
 New API namespace: `/api/repository`. Import, snapshot coverage, exact source file, search-only, provider status and streamed ask endpoints are separate from legacy documentation endpoints.
+
+
+## Restored learning tools and voice
+
+The original landing design is the main entry again. Public repository imports now open a source-backed workspace with Ask, Explain (including Analogy, Questions and Mistakes), Architecture, Interview and Video tabs. All text tools use the same supported-source index, retrieved evidence, clickable citations and static import map. Uploaded documents still open the document-based workspace, which does not inspect unavailable source files.
+
+Listen buttons and video narration use the Apache-licensed Kokoro-82M model hosted on the existing CPU backend. No external paid TTS route or silent-audio fallback is enabled. CPU work is shared and can take time.
+
+The Video tab restores **animated source walkthroughs**, not cinematic text-to-video generation. A genuine generative-video API remains unconfigured: no usable free/no-card API entitlement has been verified. The app does not claim the restored animations fulfill that separate upgrade. Video scripts use a bounded free-model call. Invalid scripts and voice failures are shown as errors, never replaced with invented generic narration or silence. Generated media is temporary.
