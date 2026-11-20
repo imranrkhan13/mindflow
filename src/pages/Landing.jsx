@@ -9,9 +9,9 @@ import { getRecentProjects } from '../lib/api.js'
 
 const FEATURES = [
   { icon: BookOpen,      label: 'Plain-English explanations', desc: 'Simple + technical, side by side' },
-  { icon: Layers,        label: 'Architecture map',           desc: 'Full system with data flow and risks' },
+  { icon: Layers,        label: 'Architecture map',           desc: 'Code-linked imports and boundaries' },
   { icon: GraduationCap, label: 'Interview prep',             desc: '60-second pitch + tiered questions' },
-  { icon: Video,         label: 'Narrated video',             desc: 'AI voice + animated diagrams, MP4' },
+  { icon: Video,         label: 'Narrated video',             desc: 'Local neural voice + animated MP4' },
 ]
 
 const EXAMPLE_REPOS = [
@@ -24,7 +24,7 @@ const EXAMPLE_REPOS = [
 export default function Landing({ onFileReady, onGithubImport, error }) {
   const inputRef = useRef(null)
   const [dragging, setDragging]     = useState(false)
-  const [tab, setTab]               = useState('file')   // 'file' | 'github'
+  const [tab, setTab]               = useState('github')   // 'file' | 'github'
   const [githubUrl, setGithubUrl]   = useState('')
   const [githubError, setGithubError] = useState('')
   const [recent, setRecent]         = useState([])
@@ -59,10 +59,10 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       <div className="relative z-10 flex min-h-screen flex-col items-center justify-center px-5 py-16">
 
         {/* Badge */}
-                <a href="https://builtbyindies.com/products/mindflow" target="_blank"><img src="https://images.builtbyindies.com/badges/winner-week-01-builtbyindies.svg" alt="#1 Product of the Week" width="250" /></a>
+                <a href="https://builtbyindies.com/products/mindflow" target="_blank" rel="noreferrer"><img src="https://images.builtbyindies.com/badges/winner-week-01-builtbyindies.svg" alt="#1 Product of the Week" width="250" /></a>
         <motion.div initial={{ opacity: 0, y: 8 }} animate={{ opacity: 1, y: 0 }}
           className="mb-6 flex items-center gap-2 rounded-full border border-umber-200 bg-white/80 px-4 py-1.5 font-sans text-xs font-medium text-umber-600 shadow-card backdrop-blur">
-          🧠 Upload docs or import a GitHub repo — get a visual mental model instantly
+          🧠 Upload docs or import a GitHub repo — explore source, explanations and videos
         </motion.div>
 
         {/* Hero */}
@@ -77,7 +77,7 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           transition={{ delay: 0.1 }}
           className="mt-4 max-w-lg text-center font-sans text-base text-umber-600">
           Paste a GitHub URL or drop a markdown file. MindFlow maps it into an
-          interactive graph with AI explanations, interview prep, and narrated videos.
+          interactive source map with code-cited answers, explanations, interview prep, and narrated videos.
         </motion.p>
 
         {/* Input card */}
@@ -187,11 +187,12 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           )}
 
           <p className="mt-3 flex items-center justify-center gap-1.5 font-sans text-xs text-umber-400">
-            No signup · Free forever · Share with a link
+            Public repos · Free, shared quotas · No paid fallback
             <ArrowRight className="h-3 w-3" />
           </p>
         </motion.div>
 
+        <p className="mt-5 max-w-lg text-center text-[11px] leading-relaxed text-umber-500">Repository imports index all supported source at a pinned commit. Uploads use the supplied document only. Answers can make mistakes. Snapshots expire after 7 days or a backend rebuild. Videos animate source diagrams, not cinematic model-generated footage.</p>
         {/* Recent public projects */}
         {recent.length > 0 && (
           <motion.div initial={{ opacity: 0, y: 14 }} animate={{ opacity: 1, y: 0 }}
@@ -243,4 +244,4 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       </div>
     </div>
   )
-}
+            }
