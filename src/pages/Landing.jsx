@@ -84,18 +84,6 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       <div className="pointer-events-none absolute inset-0 bg-gradient-to-b from-paper/30 via-paper/65 to-paper" />
 
       <div className="relative z-10 flex min-h-screen flex-col items-center justify-center px-5 py-16">
-        {/* Badge */}
-        <a
-          href="https://builtbyindies.com/products/mindflow"
-          target="_blank"
-          rel="noreferrer"
-        >
-          <img
-            src="https://images.builtbyindies.com/badges/winner-week-01-builtbyindies.svg"
-            alt="#1 Product of the Week"
-            width="250"
-          />
-        </a>
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
