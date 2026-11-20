@@ -68,22 +68,112 @@ function Logo() {
   );
 }
 function Answer({ text, sources, onSource }) {
+  function inline(value) {
+    return value
+      .split(/(\[S\d+\]|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g)
+      .map((part, i) => {
+        const source = sources.find((s) => `[${s.id}]` === part);
+        if (source)
+          return (
+            <button
+              key={i}
+              className="mf-citation"
+              onClick={() => onSource(source.path, source.start, source.end)}
+              title={`${source.path}:${source.start}-${source.end}`}
+            >
+              {source.id}
+              <ArrowUpRight size={10} />
+            </button>
+          );
+        if (part.startsWith("**") && part.endsWith("**"))
+          return <strong key={i}>{inline(part.slice(2, -2))}</strong>;
+        if (part.startsWith("`") && part.endsWith("`"))
+          return (
+            <code
+              key={i}
+              style={{
+                background: "#edf0e5",
+                padding: "1px 4px",
+                borderRadius: 3,
+                overflowWrap: "anywhere",
+              }}
+            >
+              {part.slice(1, -1)}
+            </code>
+          );
+        if (part.startsWith("*") && part.endsWith("*"))
+          return <em key={i}>{inline(part.slice(1, -1))}</em>;
+        return <span key={i}>{part}</span>;
+      });
+  }
+  let fenced = false;
   return (
-    <div className="mf-answer">
-      {text.split(/(\[S\d+\])/g).map((part, i) => {
-        const s = sources.find((s) => `[${s.id}]` === part);
-        return s ? (
-          <button
-            key={i}
-            className="mf-citation"
-            onClick={() => onSource(s.path, s.start, s.end)}
-            title={`${s.path}:${s.start}-${s.end}`}
-          >
-            {s.id}
-            <ArrowUpRight size={10} />
-          </button>
-        ) : (
-          <span key={i}>{part}</span>
+    <div className="mf-answer" style={{ whiteSpace: "normal" }}>
+      {text.split("\n").map((line, i) => {
+        if (/^\s*```/.test(line)) {
+          fenced = !fenced;
+          return null;
+        }
+        if (fenced)
+          return (
+            <div
+              key={i}
+              style={{
+                fontFamily: "monospace",
+                whiteSpace: "pre-wrap",
+                background: "#edf0e5",
+                padding: "2px 8px",
+              }}
+            >
+              {line}
+            </div>
+          );
+        if (!line.trim()) return <div key={i} style={{ height: 8 }} />;
+        const heading = line.match(/^#{1,6}\s+(.+)/);
+        if (heading)
+          return (
+            <h4
+              key={i}
+              style={{
+                fontSize: 13,
+                fontWeight: 650,
+                margin: "12px 0 5px",
+                lineHeight: 1.5,
+              }}
+            >
+              {inline(heading[1])}
+            </h4>
+          );
+        if (/^\s*[-*]\s+/.test(line))
+          return (
+            <div
+              key={i}
+              style={{ paddingLeft: 13, textIndent: -10, margin: "4px 0" }}
+            >
+              • {inline(line.replace(/^\s*[-*]\s+/, ""))}
+            </div>
+          );
+        if (/^\s*\d+[.)]\s+/.test(line))
+          return (
+            <div key={i} style={{ paddingLeft: 12, margin: "4px 0" }}>
+              {inline(line)}
+            </div>
+          );
+        if (/^\s*---+\s*$/.test(line))
+          return (
+            <hr
+              key={i}
+              style={{
+                border: 0,
+                borderTop: "1px solid #dce2d2",
+                margin: "12px 0",
+              }}
+            />
+          );
+        return (
+          <div key={i} style={{ margin: "3px 0" }}>
+            {inline(line)}
+          </div>
         );
       })}
     </div>
@@ -759,7 +849,7 @@ function RepositoryApp() {
                     ? "Architecture walkthrough"
                     : tab === "interview"
                       ? "Prepare to explain it"
-                      : "Narrated source video"}
+                      : "Video studio"}
               </h3>
               <select
                 aria-label="Source file for tools"
@@ -966,4 +1056,4 @@ function RepositoryApp() {
       )}
     </div>
   );
-              }
+}
