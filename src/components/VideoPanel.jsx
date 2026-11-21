@@ -1,3 +1,4 @@
+import { API_BASE, apiErrorMessage } from "../lib/apiConfig.js";
 import { useEffect, useRef, useState } from "react";
 import {
   Video,
@@ -12,6 +13,9 @@ import {
   getVideoStatus,
   videoDownloadUrl,
 } from "../lib/api.js";
+
+import { requestNarration } from "../lib/narration.js";
+import NarrationPlayer from "./NarrationPlayer.jsx";
 
 const VOICES = [
   ["narrator", "Michael, clear narrator"],
@@ -31,39 +35,34 @@ export default function VideoPanel({ projectId, node, standalone }) {
     [error, setError] = useState(""),
     [preview, setPreview] = useState(""),
     [previewBusy, setPreviewBusy] = useState(false);
+  const [playbackRate, setPlaybackRate] = useState(1);
+  const videoRef = useRef(null);
+  const previewController = useRef(null);
   const cancel = useRef(false),
     object = useRef(""),
     active = useRef(false);
   useEffect(
-    () => () => {
+    () => { cancel.current = false; return () => {
       cancel.current = true;
+      previewController.current?.abort();
       if (object.current) URL.revokeObjectURL(object.current);
-    },
+    }; },
     [],
   );
   async function previewVoice() {
     setPreviewBusy(true);
     setError("");
     try {
-      const base = import.meta.env.VITE_API_URL || "";
-      const r = await fetch(`${base}/api/voice/speak`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          text: "Mindflow follows your source code across files. Open a citation to check the exact evidence.",
-          voice,
-        }),
-      });
-      if (!r.ok) {
-        const d = await r.json();
-        throw new Error(d.detail || "Voice preview unavailable");
-      }
-      const b = await r.blob();
+      previewController.current?.abort();
+      const controller = new AbortController();
+      previewController.current = controller;
+      const b = await requestNarration("Let’s follow the code, one step at a time. First, a request reaches the entry point. Next, the application processes it and returns a response. Open the source to explore the details.", voice, controller.signal);
+      if (cancel.current || controller.signal.aborted) return;
       if (object.current) URL.revokeObjectURL(object.current);
       object.current = URL.createObjectURL(b);
       setPreview(object.current);
     } catch (e) {
-      setError(e.message);
+      if (e.name !== "AbortError") setError(e.message);
     } finally {
       setPreviewBusy(false);
     }
@@ -79,14 +78,13 @@ export default function VideoPanel({ projectId, node, standalone }) {
     try {
       let job_id;
       if (mode === "clip") {
-        const base = import.meta.env.VITE_API_URL || "";
-        const r = await fetch(`${base}/api/video/generate-clip`, {
+        const r = await fetch(`${API_BASE}/video/generate-clip`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ prompt }),
         });
         const d = await r.json();
-        if (!r.ok) throw new Error(d.detail || "Shared video demo unavailable");
+        if (!r.ok) throw new Error(apiErrorMessage(r.status, d.detail, "/api/video/generate-clip"));
         job_id = d.job_id;
       } else {
         const result = await startVideoGeneration(projectId, node.id, voice);
@@ -99,7 +97,7 @@ export default function VideoPanel({ projectId, node, standalone }) {
         if (cancel.current) return;
         const s = await getVideoStatus(job_id);
         setStage(s.stage);
-        setProgress(s.progress);
+        setProgress(Math.max(0, Math.min(1, Number(s.progress) || 0)));
         if (s.status === "done") {
           setStatus("done");
           return;
@@ -138,6 +136,7 @@ export default function VideoPanel({ projectId, node, standalone }) {
         </p>
       </div>
       <div className="space-y-4 px-5 py-4">
+        <div className="mf-studio-card"><Video size={22}/><h3>Your code, told clearly.</h3><p>Choose a voice, listen to a sample, then create a source-grounded walkthrough.</p><div className="mf-studio-stage"><span>Source script</span><span>Neural narration</span><span>Animated diagrams</span></div></div>
         <div className="flex gap-2">
           <button
             disabled={status === "running"}
@@ -201,6 +200,7 @@ export default function VideoPanel({ projectId, node, standalone }) {
                 aria-label="Video voice"
                 value={voice}
                 onChange={(e) => {
+                  previewController.current?.abort();
                   setVoice(e.target.value);
                   setPreview("");
                 }}
@@ -226,12 +226,7 @@ export default function VideoPanel({ projectId, node, standalone }) {
               Preview voice
             </button>
             {preview && (
-              <audio
-                aria-label="Voice preview"
-                className="w-full"
-                controls
-                src={preview}
-              />
+              <NarrationPlayer src={preview} label="Voice preview" download="mindflow-voice-sample.wav" />
             )}
           </>
         )}
@@ -277,13 +272,18 @@ export default function VideoPanel({ projectId, node, standalone }) {
         )}
         {status === "done" && job && (
           <>
-            <video
-              aria-label="Generated source walkthrough"
+            <div className="mf-video-preview"><video
+              ref={videoRef}
+              onLoadedMetadata={() => { videoRef.current.playbackRate = playbackRate; }}
+              playsInline
+              aria-label={mode === "clip" ? "Generated AI visual clip" : "Generated source walkthrough"}
               controls
               preload="metadata"
               className="w-full rounded-xl border border-umber-200"
               src={videoDownloadUrl(job)}
-            />
+            /></div>
+            <label className="mf-video-speed">Preview pace <select aria-label="Video preview pace" value={playbackRate} onChange={e => { const rate = Number(e.target.value); setPlaybackRate(rate); if(videoRef.current) { videoRef.current.preservesPitch = true; videoRef.current.playbackRate = rate; } }}><option value={0.85}>Relaxed · 0.85×</option><option value={1}>Natural · 1×</option><option value={1.15}>Brisk · 1.15×</option></select></label>
+            <p className="text-xs text-umber-500">Preview pace does not change the downloaded MP4. Voice samples use balanced audio levels; the MP4 narration is rendered by the server.</p>
             <a
               href={videoDownloadUrl(job)}
               download="mindflow-walkthrough.mp4"

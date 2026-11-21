@@ -1,0 +1,15 @@
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
+markdown-it-py
+networkx
+pydantic-settings
+python-dotenv
+pillow
+edge-tts
+gTTS
+mutagen
+
+kokoro-onnx==0.6.1
+soundfile

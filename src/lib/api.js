@@ -1,21 +1,20 @@
+import { API_BASE, apiErrorMessage } from "./apiConfig.js";
 /**
  * API base URL:
- * - Locally: Vite proxies /api → http://127.0.0.1:8000 (see vite.config.js)
- * - On Vercel: VITE_API_URL must point to your HF Space backend, e.g.
+ * - Locally: Vite proxies /api to the hosted backend (see vite.config.js)
+ * - On Vercel: defaults to the existing HF Space; VITE_API_URL can override it, e.g.
  *   https://your-username-mindflow-backend.hf.space
  *
  * VITE_API_URL is set in Vercel's project → Settings → Environment Variables.
  * It is NOT a secret — it's just a public URL. No API keys here.
  */
-const BASE = import.meta.env.VITE_API_URL
-  ? `${import.meta.env.VITE_API_URL}/api`
-  : '/api'
+const BASE = API_BASE
 
 async function call(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, options)
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: `HTTP ${res.status}` }))
-    throw new Error(err.detail || `HTTP ${res.status}`)
+    throw new Error(apiErrorMessage(res.status, err.detail, `/api${path}`))
   }
   return res.json()
 }

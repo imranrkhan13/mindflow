@@ -2,6 +2,15 @@
 @tailwind components;
 @tailwind utilities;
 
+@layer base {
+  html {
+    font-family: 'Bricolage Grotesque', ui-sans-serif, system-ui, sans-serif;
+  }
+  button, input, textarea, select {
+    font-family: inherit;
+  }
+}
+
 * {
   scrollbar-width: thin;
   scrollbar-color: #ddc9a3 transparent;

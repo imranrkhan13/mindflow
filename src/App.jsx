@@ -1,3 +1,4 @@
+import { API_BASE, apiErrorMessage } from "./lib/apiConfig.js";
 import { useEffect, useMemo, useRef, useState } from "react";
 import ReactFlow, {
   Background,
@@ -27,6 +28,8 @@ import {
 import LegacyApp from "./LegacyApp.jsx";
 import Landing from "./pages/Landing.jsx";
 import VideoPanel from "./components/VideoPanel.jsx";
+import NarrationPlayer from "./components/NarrationPlayer.jsx";
+import { requestNarration, narrationText } from "./lib/narration.js";
 import { uploadDocument } from "./lib/api.js";
 import {
   BookOpen,
@@ -37,17 +40,13 @@ import {
 } from "lucide-react";
 import "./repository.css";
 
-const BASE = import.meta.env.VITE_API_URL
-  ? `${import.meta.env.VITE_API_URL}/api/repository`
-  : "/api/repository";
+const BASE = `${API_BASE}/repository`;
 async function api(path, options) {
   const r = await fetch(BASE + path, options);
   const data = await r.json().catch(() => ({}));
   if (!r.ok)
     throw new Error(
-      typeof data.detail === "string"
-        ? data.detail
-        : `Request failed (${r.status}). Please try again.`,
+      apiErrorMessage(r.status, data.detail, `/api/repository${path}`),
     );
   return data;
 }
@@ -197,7 +196,10 @@ function SourceNode({ data }) {
     </div>
   );
 }
-const nodeTypes = { source: SourceNode };
+function QuestionNode({ data }) {
+  return <div className="mf-question-node"><Handle type="source" position={Position.Right} /><span>QUESTION</span><strong>{data.label}</strong><small>Connected to retrieved source evidence</small></div>;
+}
+const nodeTypes = { source: SourceNode, question: QuestionNode };
 function Diagram({ nodes, edges, onSource, active, fitKey }) {
   const { fitView } = useReactFlow();
   useEffect(() => {
@@ -222,8 +224,8 @@ function Diagram({ nodes, edges, onSource, active, fitKey }) {
       rows = Math.ceil(nodes.length / columns);
     return nodes.map((n, i) => ({
       id: n.id,
-      type: "source",
-      position: { x: Math.floor(i / rows) * 310, y: (i % rows) * 145 },
+      type: n.kind === "question" ? "question" : "source",
+      position: n.kind === "question" ? { x: 0, y: 160 } : { x: 360 + Math.floor((i - 1) / rows) * 310, y: ((i - 1) % rows) * 145 },
       data: { ...n, active: active === n.path },
     }));
   }, [nodes, edges, active]);
@@ -233,12 +235,12 @@ function Diagram({ nodes, edges, onSource, active, fitKey }) {
       edges={edges.map((e) => ({
         ...e,
         animated: true,
-        label: `imports · L${e.line}`,
+        label: e.kind === "evidence" ? "source evidence" : `imports · L${e.line}`,
         style: { stroke: "#b07a57", strokeWidth: 1.6 },
         labelStyle: { fill: "#745b47", fontSize: 10 },
         labelBgStyle: { fill: "#fbf8f1" },
       }))}
-      onNodeClick={(_, n) => onSource(n.data.path)}
+      onNodeClick={(_, n) => n.data.path && onSource(n.data.path)}
       nodeTypes={nodeTypes}
       fitView
       minZoom={0.25}
@@ -381,15 +383,9 @@ function Speech({ text }) {
     setBusy(true);
     setError("");
     try {
-      const response = await fetch(
-        BASE.replace("/api/repository", "/api/voice/speak"),
-        post({ text: text.replace(/\[S\d+\]/g, "").slice(0, 6000), voice }),
-      );
-      if (!response.ok) {
-        const d = await response.json();
-        throw new Error(d.detail || "Voice unavailable");
-      }
-      const blob = await response.blob();
+      const script = narrationText(text);
+      if (script.length > 6000) throw new Error("This answer exceeds the voice service’s 6,000-character limit. Ask for a shorter summary to hear the complete answer.");
+      const blob = await requestNarration(script, voice);
       if (ref.current) URL.revokeObjectURL(ref.current);
       ref.current = URL.createObjectURL(blob);
       setAudio(ref.current);
@@ -420,16 +416,11 @@ function Speech({ text }) {
         </button>
       </div>
       {audio && (
-        <>
-          <audio controls src={audio} />
-          <a href={audio} download="mindflow-narration.wav">
-            Download voice WAV
-          </a>
-        </>
+        <NarrationPlayer src={audio} />
       )}
       {error && <p role="alert">{error}</p>}
       <small>
-        Kokoro neural voice, running on our CPU. No external TTS bill.
+        Kokoro voice · balanced audio levels · WAV download. Listening pace affects playback only.
       </small>
     </div>
   );
@@ -475,6 +466,7 @@ function RepositoryApp() {
     [fitKey, setFitKey] = useState(0);
   const [tab, setTab] = useState("ask"),
     [focus, setFocus] = useState("");
+  const [graphId, setGraphId] = useState(null);
   const end = useRef(null),
     controller = useRef(null);
   useEffect(() => () => controller.current?.abort(), []);
@@ -552,10 +544,21 @@ function RepositoryApp() {
     setGraphInfo("");
     setStatus("Finding code evidence...");
     const id = Date.now();
+    setGraphId(id);
+    const questionNode = { id: `question-${id}`, kind: "question", label: question };
+    setNodes([questionNode]);
+    let answerNodes = [questionNode];
+    let answerEdges = [];
+    const previous = messages.filter(m => !m.failed && !m.provisional).slice(-4);
+    const context = previous.map(m => `${m.role}: ${m.text.slice(0, 200)}`).join("\n");
+    const contextBudget = Math.max(0, 1200 - question.length - 130);
+    const contextualQuestion = context && contextBudget > 0
+      ? `Previous conversation (context only, verify against source):\n${context.slice(-contextBudget)}\n\nCurrent question: ${question}`
+      : question;
     setMessages((prev) => [
       ...prev,
       { role: "user", text: question, id: id - 1, tab },
-      { role: "assistant", text: "", sources: [], id, provisional: true, tab },
+      { role: "assistant", text: "", sources: [], id, provisional: true, tab, graph: { nodes: [questionNode], edges: [] } },
     ]);
     const update = (patch) =>
       setMessages((prev) =>
@@ -569,12 +572,12 @@ function RepositoryApp() {
     let completed = false;
     try {
       const response = await fetch(`${BASE}/${project.id}/ask`, {
-        ...post({ question }),
+        ...post({ question: contextualQuestion }),
         signal: controller.current.signal,
       });
       if (!response.ok) {
         const d = await response.json().catch(() => ({}));
-        throw new Error(d.detail || `Request failed (${response.status})`);
+        throw new Error(apiErrorMessage(response.status, d.detail, `/api/repository/${project.id}/ask`));
       }
       const reader = response.body.getReader(),
         decoder = new TextDecoder();
@@ -597,8 +600,26 @@ function RepositoryApp() {
             setSources(data.sources);
             update({ sources: data.sources, searched: data.searched_files });
           }
-          if (type === "node") setNodes((prev) => [...prev, data]);
-          if (type === "edge") setEdges((prev) => [...prev, data]);
+          if (type === "node") {
+            const existing = answerNodes.find(n => n.path && n.path === data.path);
+            if (existing) answerNodes = answerNodes.map(n => n === existing ? { ...data, citations: [...new Set([...(existing.citations || []), ...(data.citations || [])])] } : n);
+            else if (!answerNodes.some(n => n.id === data.id)) answerNodes.push(data);
+          }
+          if (type === "edge" && !answerEdges.some(e => e.id === data.id)) answerEdges.push(data);
+          if (type === "sources" || type === "node" || type === "edge") {
+            for (const source of currentSources) {
+              let node = answerNodes.find(n => n.path === source.path);
+              if (!node) {
+                node = { id: `file-${source.path}`, path: source.path, label: source.path.split("/").pop(), citations: [] };
+                answerNodes.push(node);
+              }
+              answerNodes = answerNodes.map(n => n.id === node.id ? { ...n, citations: [...new Set([...(n.citations || []), source.id])] } : n);
+            }
+            const evidence = answerNodes.filter(n => n.path).map(n => ({ id: `evidence-${n.id}`, source: questionNode.id, target: n.id, kind: "evidence" }));
+            setNodes([...answerNodes]);
+            setEdges([...answerEdges, ...evidence]);
+            update({ graph: { nodes: [...answerNodes], edges: [...answerEdges, ...evidence] } });
+          }
           if (type === "graph_info") setGraphInfo(data.text);
           if (type === "answer") update((m) => ({ text: m.text + data.text }));
           if (type === "error" || type === "invalid") {
@@ -774,14 +795,14 @@ function RepositoryApp() {
         <section className="mf-canvas">
           <div className="mf-canvas-title">
             <div>
-              <span className="mf-eyebrow">CODE CONNECTIONS</span>
+              <span className="mf-eyebrow">QUESTION → EVIDENCE</span>
               <h2>
                 {nodes.length
                   ? "Follow the evidence."
                   : "Your code, connected."}
               </h2>
             </div>
-            <span className="mf-map-badge">STATIC IMPORT MAP</span>
+            <span className="mf-map-badge">ANSWER MAP</span>
           </div>
           {nodes.length ? (
             <ReactFlowProvider>
@@ -816,14 +837,13 @@ function RepositoryApp() {
             {busy
               ? "Searching code / streaming evidence"
               : nodes.length
-                ? `${nodes.length} source files · ${edges.length} verified imports`
+                ? `${nodes.filter(n => n.path).length} source files · answer evidence map`
                 : "Ready to explore"}
             <button onClick={() => setFitKey((k) => k + 1)}>Fit map</button>
           </div>
           {nodes.length > 0 && (
             <div className="mf-map-limit">
-              Import relationships, not a runtime trace. Click any file to
-              inspect its code.
+              Question links show retrieved evidence; file links show static imports. Click a file to inspect it.
             </div>
           )}
         </section>
@@ -934,9 +954,9 @@ function RepositoryApp() {
                     </p>
                     {tab === "ask" &&
                       [
-                        "How does importing a GitHub repository work?",
-                        "Where are API requests made and how are errors handled?",
-                        "What does the chat implementation actually do?",
+                        "Give me an overview of this repository and its entry points.",
+                        "Trace the main data flow across files.",
+                        "Where are errors handled, and what tests cover them?",
                       ].map((q) => (
                         <button key={q} onClick={() => ask(q)}>
                           {q}
@@ -944,9 +964,7 @@ function RepositoryApp() {
                         </button>
                       ))}
                     <div className="mf-chat-disclaimer">
-                      Each question is a new code search. Name the function or
-                      feature in follow-ups. The model sees retrieved excerpts,
-                      not the entire repo in one prompt.
+                      Searches all indexed files with recent conversation context. The model reads relevant excerpts. Open coverage to see excluded files.
                     </div>
                   </div>
                 ) : (
@@ -965,6 +983,7 @@ function RepositoryApp() {
                           <span>draft · streaming</span>
                         )}
                       </div>
+                      {m.role === "assistant" && m.graph && <button disabled={busy} className={`mf-view-map ${graphId === m.id ? "active" : ""}`} onClick={() => { setNodes(m.graph.nodes); setEdges(m.graph.edges); setGraphId(m.id); setFitKey(k => k + 1); }}><GitBranch size={14} />{graphId === m.id ? "Viewing answer map" : "View answer map"}</button>}
                       <Answer
                         text={
                           m.text ||
