@@ -238,3 +238,116 @@ def test_expanded_archive_budget_still_applies(monkeypatch):
     with pytest.raises(HTTPException) as ex:
         r.index_archive(archive({'main.ts': 'x' * 11}), 'x', 'y', 'b' * 40)
     assert ex.value.status_code == 413
+
+
+def test_large_file_tree_counts_exclusions_without_old_20000_entry_rejection():
+    files = {f'assets/icon-{i}.png': 'asset' for i in range(20_001)}
+    files['src/main.ts'] = 'export const fullImport = true;'
+    data = r.index_archive(archive(files), 'x', 'y', 'b' * 40)
+    assert data['coverage']['archive_entries'] == 20_002
+    assert data['coverage']['indexed_files'] == 1
+    assert data['coverage']['omitted_files'] == 20_001
+    assert data['coverage']['truncated'] is False
+
+
+def test_more_than_2500_supported_files_are_preserved():
+    files = {f'source/file-{i}.ts': f'export const item{i} = true;' for i in range(2_501)}
+    data = r.index_archive(archive(files), 'x', 'y', 'b' * 40)
+    assert len(data['files']) == 2_501
+
+
+def test_archive_entry_safety_budget_is_still_enforced(monkeypatch):
+    monkeypatch.setattr(r, 'MAX_ENTRIES', 2)
+    with pytest.raises(HTTPException) as ex:
+        r.index_archive(archive({'a.ts':'a', 'b.ts':'b', 'c.ts':'c'}), 'x', 'y', 'b' * 40)
+    assert ex.value.status_code == 413
+
+
+def test_compressed_snapshots_and_legacy_snapshots_are_readable():
+    import json
+    import time
+    data = sample()
+    r.save(data)
+    with r.connection() as con:
+        stored = con.execute('SELECT data FROM code_snapshots WHERE id=?', (data['id'],)).fetchone()[0]
+        assert isinstance(stored, bytes)
+        assert len(stored) < len(json.dumps(data).encode())
+    assert r.load(data['id']) == data
+    with r.connection() as con:
+        con.execute('UPDATE code_snapshots SET data=? WHERE id=?', (json.dumps(data), data['id']))
+    assert r.load(data['id']) == data
+
+
+def test_documentation_and_bundle_contain_every_indexed_file():
+    import json
+    from app.services.repository_docs import documentation, source_bundle
+    data = sample()
+    doc = documentation(data)
+    assert data['sha'] in doc
+    assert 'runtime' in doc
+    for file in data['files']:
+        assert file['path'] in doc
+    for excluded in data['omitted']:
+        assert excluded['path'] in doc
+    with zipfile.ZipFile(io.BytesIO(source_bundle(data, doc))) as bundle:
+        assert bundle.read('DOCUMENTATION.md').decode() == doc
+        assert json.loads(bundle.read('import-graph.json')) == data['edges']
+        for file in data['files']:
+            assert bundle.read('source/' + file['path']).decode() == file['text']
+        assert 'source/.env' not in bundle.namelist()
+
+
+def test_documentation_exports_are_downloadable_via_api():
+    app = FastAPI(); app.include_router(r.router)
+    data = sample(); r.save(data)
+    with TestClient(app) as client:
+        response = client.get(f"/api/repository/{data['id']}/documentation")
+        assert response.status_code == 200
+        assert 'attachment;' in response.headers['content-disposition']
+        assert 'Complete indexed file inventory' in response.text
+        response = client.get(f"/api/repository/{data['id']}/documentation?bundle=true")
+        assert response.status_code == 200
+        assert response.headers['content-type'] == 'application/zip'
+        with zipfile.ZipFile(io.BytesIO(response.content)) as bundle:
+            assert 'source/src/chat.py' in bundle.namelist()
+
+
+def test_summary_does_not_decompress_source_for_saved_projects(monkeypatch):
+    data = sample(); r.save(data)
+    monkeypatch.setattr(r, 'load', lambda sid: (_ for _ in ()).throw(AssertionError('Full source must not be loaded')))
+    summary = r.load_summary(data['id'])
+    assert summary['edge_count'] == len(data['edges'])
+    assert 'edges' not in summary
+    assert all('text' not in file for file in summary['files'])
+
+
+def test_import_reuses_same_commit_without_archive_download(monkeypatch):
+    data = sample(); r.save(data)
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        async def get(self, *args, **kwargs):
+            return http_response()
+        def stream(self, *args, **kwargs): raise AssertionError('Cached commit must not download an archive')
+    def http_response():
+        class Response:
+            status_code = 200
+            def json(self): return {'sha': data['sha']}
+        return Response()
+    monkeypatch.setattr(r.httpx, 'AsyncClient', Client)
+    app = FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        response = client.post('/api/repository/import', json={'url': 'https://github.com/owner/repo'})
+    assert response.status_code == 200
+    assert response.json()['reused'] is True
+    assert response.json()['id'] == data['id']
+    assert response.headers['content-encoding'] == 'gzip'
+
+
+def test_expired_commits_are_not_reused():
+    import time
+    data = sample(); data['repository'] = 'expired/test-only'; r.save(data)
+    with r.connection() as con:
+        con.execute('UPDATE code_snapshots SET created=? WHERE id=?', (time.time()-86400*8, data['id']))
+    assert r.cached_summary(data['repository'], data['sha']) is None

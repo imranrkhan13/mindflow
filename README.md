@@ -1,5 +1,7 @@
 # Mindflow / Code
 
+For the complete application guide, see [How Mindflow works](docs/MINDFLOW.md).
+
 Explore a public GitHub repository through code search, source-linked answers and a clickable import map. Documentation mode remains at `/docs`.
 
 ## How it works
@@ -16,7 +18,7 @@ Explore a public GitHub repository through code search, source-linked answers an
 - Public repositories only. No token is attached to imports. No source code is executed.
 - Repository root URLs only. Default branch snapshot, no automatic commit watching.
 - Generated directories, dependencies, lockfiles, assets, likely credential files, binary and non-UTF-8 files are excluded and listed. Symlinks are not followed. Git history and submodule contents are not imported.
-- The deployed importer keeps large files intact under the repository text budget and spools large archive downloads to disk. Repositories exceeding 100 MB compressed / 500 MB expanded, 2,500 supported files, 12 MB indexed text are rejected rather than silently reduced. Up to 20,000 archive entries are inspected.
+- The deployed importer keeps large files intact under the repository text budget and spools large archive downloads to disk. Repositories exceeding 250 MB compressed / 1 GB expanded, 50,000 supported files, 192 MB indexed text are rejected rather than silently reduced. Up to 200,000 archive entries are inspected.
 - The model sees at most 16 relevant source excerpts. Oversized/minified windows remain in the file browser but may not fit the model context. Retrieval can miss relevant evidence, especially across languages, aliases or dynamic imports.
 - Follow-ups include a bounded excerpt of the last four completed messages in the search question. This is session-local context, not persistent memory. Each question still searches the full supported-source index.
 - Each answer retains a question-to-evidence graph in session memory. Evidence links connect to retrieved source files; separate file edges show static imports. Evidence links do not claim a runtime sequence.
@@ -46,3 +48,13 @@ Official generative video demo: https://huggingface.co/spaces/Lightricks/ltx-vid
 ## Narration controls
 
 Answer narration removes display-only Markdown, citations, URLs and fenced code before speech synthesis. The browser applies gentle dynamics compression and peak normalization to answer audio and voice samples, then exports PCM WAV. Silent recordings are rejected. These steps balance levels; they do not upgrade Kokoro’s voice model. Audio and video preview pace controls preserve pitch and do not alter downloaded MP4s. The server-rendered MP4 quality, narration mix, resolution and LTX generation remain controlled by the external backend, whose source is not in this repository.
+
+## Repository documentation and source exports
+
+The workspace header offers **Docs** (Markdown) and **Source ZIP**. Documentation includes the pinned commit, coverage, languages, directory counts, package manifests and scripts, dependency versions, complete indexed Markdown/text documentation, a source-linked inventory of every indexed file, detected static import connections, and explicit exclusions. It is generated from source rather than model guesses and does not claim to prove runtime behavior. The ZIP includes that document, coverage and graph JSON, plus every indexed source file. Excluded credentials, generated files and assets are not bundled.
+
+Snapshot JSON is compressed in SQLite; existing uncompressed snapshots remain readable. Large archive downloads spill to disk. Import parsing, snapshot compression, search and export generation run outside the API event loop. File browsing is paginated without reducing search coverage.
+
+## Faster project loading
+
+Importing an unchanged commit reuses its saved snapshot instead of downloading the archive again. A separate lightweight summary lets saved workspaces open without decompressing the full repository source. Summary responses use gzip when the browser supports it and send an import-connection count instead of the entire graph; individual answer graphs still include their actual edges. New repositories still need an initial download and indexing pass.

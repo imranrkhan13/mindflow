@@ -6,7 +6,7 @@ export default {
       colors: {
         paper: {
           DEFAULT: "#fdfcfa",
-          50: "#ffffff",
+          50: "#fdfcfa",
           100: "#faf8f4",
           200: "#f3efe7",
           300: "#e8e1d4",
@@ -29,8 +29,8 @@ export default {
           bright: "#d4895c",
         },
         sage: {
-          DEFAULT: "#6b7c5e",
-          dim: "#566249",
+          DEFAULT: "#8b6b50",
+          dim: "#6a4e39",
         },
       },
       fontFamily: {

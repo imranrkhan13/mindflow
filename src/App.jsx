@@ -91,7 +91,7 @@ function Answer({ text, sources, onSource }) {
             <code
               key={i}
               style={{
-                background: "#edf0e5",
+                background: "#f3ece2",
                 padding: "1px 4px",
                 borderRadius: 3,
                 overflowWrap: "anywhere",
@@ -120,7 +120,7 @@ function Answer({ text, sources, onSource }) {
               style={{
                 fontFamily: "monospace",
                 whiteSpace: "pre-wrap",
-                background: "#edf0e5",
+                background: "#f3ece2",
                 padding: "2px 8px",
               }}
             >
@@ -164,7 +164,7 @@ function Answer({ text, sources, onSource }) {
               key={i}
               style={{
                 border: 0,
-                borderTop: "1px solid #dce2d2",
+                borderTop: "1px solid #e8e1d4",
                 margin: "12px 0",
               }}
             />
@@ -248,7 +248,7 @@ function Diagram({ nodes, edges, onSource, active, fitKey }) {
       proOptions={{ hideAttribution: true }}
       nodesDraggable
     >
-      <Background gap={22} size={1} color="#d9d5cb" />
+      <Background gap={22} size={1} color="#e8e1d4" />
       <Controls showInteractive={false} />
     </ReactFlow>
   );
@@ -316,8 +316,8 @@ function Coverage({ project, close }) {
       >
         <div className="mf-sheet-header">
           <div>
-            <span className="mf-eyebrow">NOT A README SUMMARY</span>
-            <h3>What Mindflow actually read.</h3>
+            <span className="mf-eyebrow">WHAT WE READ</span>
+            <h3>Files included in your project.</h3>
           </div>
           <button onClick={close} aria-label="Close coverage">
             <X />
@@ -330,7 +330,7 @@ function Coverage({ project, close }) {
           </div>
           <div>
             <strong>{project.coverage.indexed_files}</strong>
-            <span>indexed in full</span>
+            <span>files read in full</span>
           </div>
           <div>
             <strong>{project.coverage.omitted_files}</strong>
@@ -467,6 +467,9 @@ function RepositoryApp() {
   const [tab, setTab] = useState("ask"),
     [focus, setFocus] = useState("");
   const [graphId, setGraphId] = useState(null);
+  const [fileLimit, setFileLimit] = useState(100);
+  const filteredFiles = useMemo(() => (project?.files || []).filter(f => f.path.toLowerCase().includes(filter.toLowerCase())), [project, filter]);
+  useEffect(() => setFileLimit(100), [filter, project]);
   const end = useRef(null),
     controller = useRef(null);
   useEffect(() => () => controller.current?.abort(), []);
@@ -628,7 +631,7 @@ function RepositoryApp() {
           }
           if (type === "done") {
             update({ provisional: false, provider: data.provider });
-            setStatus("Source references checked");
+            setStatus("Answer ready — check the linked files");
             completed = true;
           }
         }
@@ -705,10 +708,9 @@ function RepositoryApp() {
         {loading && (
           <div className="mf-loading-screen">
             <Loader2 className="mf-spin" />
-            <h2>Building your source map</h2>
+            <h2>Getting your code ready</h2>
             <p>
-              Pinning a commit and indexing supported source, tests,
-              configuration and docs. No source code is executed.
+              We check for a saved copy first. A new, large repository can take a few minutes to download and read. Opening the same saved project is faster.
             </p>
           </div>
         )}
@@ -740,9 +742,11 @@ function RepositoryApp() {
             <GitBranch size={13} />
             {project.sha.slice(0, 8)}
           </a>
+          <a className="mf-docs-download" href={`${BASE}/${project.id}/documentation`} aria-label="Download repository documentation"><BookOpen size={14} />Docs</a>
+          <a className="mf-docs-download" href={`${BASE}/${project.id}/documentation?bundle=true`} aria-label="Download all indexed source and documentation"><FileCode2 size={14} />Source ZIP</a>
           <button className="mf-coverage-btn" onClick={() => setCoverage(true)}>
             <Check size={14} />
-            {project.coverage.indexed_files} files indexed
+            {project.coverage.indexed_files} files ready
           </button>
         </div>
       </header>
@@ -761,11 +765,7 @@ function RepositoryApp() {
             />
           </label>
           <div className="mf-file-list">
-            {project.files
-              .filter((f) =>
-                f.path.toLowerCase().includes(filter.toLowerCase()),
-              )
-              .map((f) => (
+            {filteredFiles.slice(0, fileLimit).map((f) => (
                 <button
                   key={f.path}
                   className={active === f.path ? "selected" : ""}
@@ -776,6 +776,7 @@ function RepositoryApp() {
                   <span>{f.path}</span>
                 </button>
               ))}
+            {filteredFiles.length > fileLimit && <button onClick={() => setFileLimit(count => count + 100)}>Show more ({Math.min(fileLimit, filteredFiles.length)} of {filteredFiles.length})</button>}
           </div>
           <button
             className="mf-coverage-footer"
@@ -783,7 +784,7 @@ function RepositoryApp() {
           >
             <ShieldCheck size={15} />
             <span>
-              Coverage & exclusions
+              Files included and skipped
               <small>
                 {project.coverage.omitted_files} files excluded · no silent
                 truncation
@@ -795,7 +796,7 @@ function RepositoryApp() {
         <section className="mf-canvas">
           <div className="mf-canvas-title">
             <div>
-              <span className="mf-eyebrow">QUESTION → EVIDENCE</span>
+              <span className="mf-eyebrow">YOUR QUESTION AND ITS SOURCE FILES</span>
               <h2>
                 {nodes.length
                   ? "Follow the evidence."
@@ -828,7 +829,7 @@ function RepositoryApp() {
                 can be traced to a real line of code.
               </p>
               <span>
-                {project.edges.length} import connections found in this snapshot
+                {(project.edge_count ?? project.edges?.length ?? 0)} import connections found in this snapshot
               </span>
             </div>
           )}
@@ -843,7 +844,7 @@ function RepositoryApp() {
           </div>
           {nodes.length > 0 && (
             <div className="mf-map-limit">
-              Question links show retrieved evidence; file links show static imports. Click a file to inspect it.
+              Lines connect your question to the files we found. Click a file to read its code.
             </div>
           )}
         </section>
@@ -949,7 +950,7 @@ function RepositoryApp() {
                     </h2>
                     <p>
                       {tab === "ask"
-                        ? "Ask about a route, a component or a function. Each question searches every indexed file and retrieves the most relevant code."
+                        ? "Ask about a route, a component or a function. We search the saved code and read the parts that best match your question."
                         : "Choose a file and a tool above. Explanations, analogies, architecture and interview prep keep source references attached."}
                     </p>
                     {tab === "ask" &&
@@ -964,7 +965,7 @@ function RepositoryApp() {
                         </button>
                       ))}
                     <div className="mf-chat-disclaimer">
-                      Searches all indexed files with recent conversation context. The model reads relevant excerpts. Open coverage to see excluded files.
+                      We search the saved files, then use the closest matches to answer. Open “Files included” to see what was left out.
                     </div>
                   </div>
                 ) : (
@@ -1053,7 +1054,7 @@ function RepositoryApp() {
                 <p>
                   Answers can be wrong. Open the cited code.{" "}
                   <button onClick={() => setCoverage(true)}>
-                    View coverage
+                    Files included
                   </button>
                 </p>
               </div>

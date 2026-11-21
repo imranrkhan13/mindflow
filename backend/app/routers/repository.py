@@ -5,6 +5,7 @@ import ast
 import asyncio
 import collections
 import hashlib
+import gzip
 import io
 import json
 import math
@@ -15,22 +16,25 @@ import time
 import tempfile
 import uuid
 import zipfile
+import zlib
 from pathlib import PurePosixPath
 from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, Response
 from pydantic import BaseModel, Field
 
 from app.config import settings
 from app.services.store import DB_PATH
+from app.services.repository_docs import documentation, source_bundle
 
 router = APIRouter(prefix="/api/repository", tags=["repository"])
-MAX_ZIP = 100_000_000
-MAX_UNPACKED = 500_000_000
-MAX_TEXT = 12_000_000
-MAX_FILES = 2500
+MAX_ZIP = 250_000_000
+MAX_UNPACKED = 1_000_000_000
+MAX_TEXT = 192_000_000
+MAX_FILES = 50_000
+MAX_ENTRIES = 200_000
 EXTENSIONS = {'.py','.js','.jsx','.ts','.tsx','.mjs','.cjs','.json','.html','.css','.scss','.sql','.sh','.bash','.yml','.yaml','.toml','.ini','.cfg','.go','.rs','.java','.kt','.rb','.php','.c','.h','.cpp','.hpp','.cs','.swift','.vue','.svelte','.graphql','.proto','.prisma','.md','.mdx','.txt','.xml','.ex','.exs','.erl','.r','.dart','.tf','.dockerfile'}
 GENERATED = {'node_modules','.git','.cloud-attachments','vendor','.venv','venv','dist','build','coverage','__pycache__','.next','.nuxt','.turbo','target'}
 LOCKS = {'package-lock.json','yarn.lock','pnpm-lock.yaml','poetry.lock','uv.lock','Cargo.lock','composer.lock'}
@@ -43,6 +47,7 @@ def connection():
     con=sqlite3.connect(DB_PATH)
     con.row_factory=sqlite3.Row
     con.execute('CREATE TABLE IF NOT EXISTS code_snapshots (id TEXT PRIMARY KEY, created REAL, data TEXT)')
+    con.execute('CREATE TABLE IF NOT EXISTS code_snapshot_summaries (id TEXT PRIMARY KEY, repository TEXT, sha TEXT, data TEXT)')
     return con
 
 
@@ -53,7 +58,9 @@ def save(data):
         count=con.execute('SELECT count(*) FROM code_snapshots').fetchone()[0]
         if count>=20:
             con.execute('DELETE FROM code_snapshots WHERE id IN (SELECT id FROM code_snapshots ORDER BY created LIMIT ?)',(count-19,))
-        con.execute('INSERT INTO code_snapshots VALUES (?,?,?)',(data['id'],time.time(),json.dumps(data)))
+        con.execute('DELETE FROM code_snapshot_summaries WHERE id NOT IN (SELECT id FROM code_snapshots)')
+        con.execute('INSERT OR REPLACE INTO code_snapshot_summaries VALUES (?,?,?,?)', (data['id'], data['repository'], data['sha'], json.dumps(public(data))))
+        con.execute('INSERT INTO code_snapshots VALUES (?,?,?)',(data['id'],time.time(),zlib.compress(json.dumps(data).encode('utf-8'), level=6)))
 
 
 def load(sid):
@@ -62,7 +69,37 @@ def load(sid):
     with connection() as con:
         row=con.execute('SELECT data FROM code_snapshots WHERE id=?',(sid,)).fetchone()
     if not row: raise HTTPException(404,'Snapshot expired. Import the public repository again.')
-    return json.loads(row['data'])
+    stored = row['data']
+    return json.loads(zlib.decompress(stored) if isinstance(stored, bytes) else stored)
+
+
+def load_summary(sid):
+    if not re.fullmatch(r'[a-f0-9-]{36}', sid):
+        raise HTTPException(404, 'Project not found. Import the repository again.')
+    with connection() as con:
+        row = con.execute('SELECT s.data FROM code_snapshot_summaries s JOIN code_snapshots c ON c.id=s.id WHERE s.id=?', (sid,)).fetchone()
+    if row:
+        return json.loads(row['data'])
+    data = load(sid)
+    result = public(data)
+    with connection() as con:
+        con.execute('INSERT OR REPLACE INTO code_snapshot_summaries VALUES (?,?,?,?)', (sid, data['repository'], data['sha'], json.dumps(result)))
+    return result
+
+
+def cached_summary(repository, sha):
+    with connection() as con:
+        row = con.execute('SELECT s.data FROM code_snapshot_summaries s JOIN code_snapshots c ON c.id=s.id WHERE s.repository=? AND s.sha=? AND c.created>? ORDER BY c.created DESC LIMIT 1', (repository, sha, time.time()-86400*7)).fetchone()
+    return json.loads(row['data']) if row else None
+
+
+def summary_response(data, request):
+    payload = json.dumps(data).encode('utf-8')
+    headers = {'Vary': 'Accept-Encoding'}
+    if 'gzip' in request.headers.get('accept-encoding', '').lower():
+        payload = gzip.compress(payload, compresslevel=3)
+        headers['Content-Encoding'] = 'gzip'
+    return Response(payload, media_type='application/json', headers=headers)
 
 
 def guard(request, kind, limit):
@@ -206,7 +243,7 @@ def index_archive(raw, owner, repo, sha):
     try: archive=zipfile.ZipFile(io.BytesIO(raw) if isinstance(raw, (bytes, bytearray)) else raw)
     except zipfile.BadZipFile: raise HTTPException(502,'GitHub returned an invalid archive.')
     entries=[i for i in archive.infolist() if not i.is_dir()]
-    if len(entries)>20000: raise HTTPException(413,'Repository has over 20,000 entries. Import rejected, not silently shortened.')
+    if len(entries)>MAX_ENTRIES: raise HTTPException(413,f'Repository has over {MAX_ENTRIES:,} archive entries. Import rejected; no files were silently omitted.')
     if sum(x.file_size for x in entries)>MAX_UNPACKED: raise HTTPException(413,f'Expanded repository exceeds {MAX_UNPACKED / 1_000_000:g} MB. Import rejected.')
     for entry in entries:
         path='/'.join(entry.filename.split('/')[1:])
@@ -222,21 +259,21 @@ def index_archive(raw, owner, repo, sha):
         # line-addressable windows by build_chunks. Bound allocation by the
         # repository text budget instead of rejecting ordinary large test files.
         if entry.file_size > MAX_TEXT:
-            raise HTTPException(413,f'Source file {path} exceeds the 12 MB repository text budget. Import rejected; no source was shortened.')
+            raise HTTPException(413,f'Source file {path} exceeds the {MAX_TEXT / 1_000_000:g} MB repository text budget. Import rejected; no source was shortened.')
         content=archive.read(entry)
         if b'\x00' in content: omitted.append({'path':path,'reason':'binary content'}); continue
         try: text=content.decode('utf-8-sig')
         except UnicodeDecodeError: omitted.append({'path':path,'reason':'non-UTF-8 text'}); continue
         text_bytes+=len(content)
-        if text_bytes>MAX_TEXT or len(files)>=MAX_FILES: raise HTTPException(413,'Source exceeds free-demo capacity (2,500 text files / 12 MB). Import rejected; no partial repository is presented as complete.')
+        if text_bytes>MAX_TEXT or len(files)>=MAX_FILES: raise HTTPException(413,f'Source exceeds capacity ({MAX_FILES:,} supported text files / {MAX_TEXT / 1_000_000:g} MB). Import rejected; no partial repository is presented as complete.')
         files.append({'path':path,'text':text,'lines':len(text.splitlines()),'bytes':len(content),'language':PurePosixPath(path).suffix.lstrip('.') or 'text'})
     if not files: raise HTTPException(422,'No supported source or text files found.')
     files.sort(key=lambda x:x['path'])
-    return {'id':str(uuid.uuid4()),'repository':f'{owner}/{repo}','sha':sha,'url':f'https://github.com/{owner}/{repo}', 'files':files,'omitted':omitted,'edges':relationships(files),'coverage':{'archive_entries':total,'indexed_files':len(files),'indexed_bytes':text_bytes,'omitted_files':len(omitted),'truncated':False,'scope':'All supported UTF-8 source, configuration, tests and docs in the pinned default-branch archive. No submodule contents or Git history. Generated files, assets and potential credentials excluded with a visible inventory.'}}
+    return {'id':str(uuid.uuid4()),'repository':f'{owner}/{repo}','sha':sha,'url':f'https://github.com/{owner}/{repo}', 'files':files,'omitted':omitted,'edges':relationships(files),'coverage':{'archive_entries':total,'indexed_files':len(files),'indexed_bytes':text_bytes,'omitted_files':len(omitted),'truncated':False,'limits':{'archive_entries':MAX_ENTRIES,'supported_files':MAX_FILES,'indexed_bytes':MAX_TEXT,'archive_bytes':MAX_ZIP,'expanded_bytes':MAX_UNPACKED},'scope':'All supported UTF-8 source, configuration, tests and docs in the pinned default-branch archive. No submodule contents or Git history. Generated files, assets and potential credentials excluded with a visible inventory.'}}
 
 
 def public(data):
-    return {**{k:data[k] for k in ['id','repository','sha','url','coverage','omitted','edges']},'files':[{k:f[k] for k in ['path','lines','bytes','language']} for f in data['files']]}
+    return {**{k:data[k] for k in ['id','repository','sha','url','coverage','omitted']},'edge_count':len(data['edges']),'files':[{k:f[k] for k in ['path','lines','bytes','language']} for f in data['files']]}
 
 
 class ImportRequest(BaseModel):
@@ -265,6 +302,9 @@ async def import_repo(body: ImportRequest, request: Request):
             if r.status_code!=200: raise HTTPException(422,'Public repository not found or default branch unavailable. Private repositories are not supported.')
             sha=r.json().get('sha','')
             if not re.fullmatch('[a-f0-9]{40}',sha): raise HTTPException(502,'Could not pin the repository commit.')
+            cached = await asyncio.to_thread(cached_summary, f'{owner}/{repo}', sha)
+            if cached:
+                return await asyncio.to_thread(summary_response, {**cached, 'reused': True}, request)
             # Spill larger downloads to disk rather than holding multiple copies
             # of the complete ZIP in memory. Still enforce a hard download budget.
             with tempfile.SpooledTemporaryFile(max_size=4_000_000, mode='w+b') as archive:
@@ -272,9 +312,9 @@ async def import_repo(body: ImportRequest, request: Request):
                     if response.status_code!=200: raise HTTPException(502,'Could not download the public repository archive.')
                     await download_archive(response, archive)
                 archive.seek(0)
-                data=index_archive(archive,owner,repo,sha)
-        save(data)
-        return public(data)
+                data=await asyncio.to_thread(index_archive,archive,owner,repo,sha)
+        await asyncio.to_thread(save,data)
+        return await asyncio.to_thread(summary_response, {**public(data), 'reused': False}, request)
 
 
 @router.get('/status')
@@ -292,7 +332,20 @@ async def provider_status():
 
 
 @router.get('/{sid}')
-async def snapshot(sid: str): return public(load(sid))
+async def snapshot(sid: str, request: Request):
+    data = await asyncio.to_thread(load_summary, sid)
+    return await asyncio.to_thread(summary_response, data, request)
+
+
+@router.get('/{sid}/documentation')
+async def export_documentation(sid: str, bundle: bool = False):
+    data = await asyncio.to_thread(load, sid)
+    document = await asyncio.to_thread(documentation, data)
+    filename = re.sub(r'[^A-Za-z0-9_.-]', '-', data['repository'])
+    if bundle:
+        content = await asyncio.to_thread(source_bundle, data, document)
+        return Response(content, media_type='application/zip', headers={'Content-Disposition': f'attachment; filename="{filename}-source-and-docs.zip"'})
+    return Response(document, media_type='text/markdown; charset=utf-8', headers={'Content-Disposition': f'attachment; filename="{filename}-documentation.md"'})
 
 
 @router.get('/{sid}/file')
@@ -382,7 +435,7 @@ class AskRequest(BaseModel):
 
 @router.post('/{sid}/search')
 async def search(sid: str,body: AskRequest):
-    data=load(sid); snippets=retrieve(data,body.question)
+    data=await asyncio.to_thread(load,sid); snippets=await asyncio.to_thread(retrieve,data,body.question)
     return {'sources':snippets,'graph':evidence_graph(data,snippets),'searched_files':len(data['files']),'commit':data['sha']}
 
 
@@ -397,10 +450,10 @@ def event(kind,data): return 'event: '+kind+'\ndata: '+json.dumps(data)+'\n\n'
 @router.post('/{sid}/ask')
 async def ask(sid: str,body: AskRequest,request: Request):
     guard(request,'ask',30)
-    data=load(sid)
+    data=await asyncio.to_thread(load,sid)
     async def stream():
         yield event('status',{'text':'Searching every indexed source file...'})
-        snippets=retrieve(data,body.question)
+        snippets=await asyncio.to_thread(retrieve,data,body.question)
         yield event('sources',{'sources':snippets,'searched_files':len(data['files']),'commit':data['sha']})
         graph=evidence_graph(data,snippets)
         for node in graph['nodes']:
