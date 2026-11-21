@@ -12,6 +12,7 @@ import os
 import re
 import sqlite3
 import time
+import tempfile
 import uuid
 import zipfile
 from pathlib import PurePosixPath
@@ -26,8 +27,8 @@ from app.config import settings
 from app.services.store import DB_PATH
 
 router = APIRouter(prefix="/api/repository", tags=["repository"])
-MAX_ZIP = 25_000_000
-MAX_UNPACKED = 100_000_000
+MAX_ZIP = 100_000_000
+MAX_UNPACKED = 500_000_000
 MAX_TEXT = 12_000_000
 MAX_FILES = 2500
 EXTENSIONS = {'.py','.js','.jsx','.ts','.tsx','.mjs','.cjs','.json','.html','.css','.scss','.sql','.sh','.bash','.yml','.yaml','.toml','.ini','.cfg','.go','.rs','.java','.kt','.rb','.php','.c','.h','.cpp','.hpp','.cs','.swift','.vue','.svelte','.graphql','.proto','.prisma','.md','.mdx','.txt','.xml','.ex','.exs','.erl','.r','.dart','.tf','.dockerfile'}
@@ -202,11 +203,11 @@ def relationships(files):
 
 def index_archive(raw, owner, repo, sha):
     files=[]; omitted=[]; text_bytes=0; total=0
-    try: archive=zipfile.ZipFile(io.BytesIO(raw))
+    try: archive=zipfile.ZipFile(io.BytesIO(raw) if isinstance(raw, (bytes, bytearray)) else raw)
     except zipfile.BadZipFile: raise HTTPException(502,'GitHub returned an invalid archive.')
     entries=[i for i in archive.infolist() if not i.is_dir()]
     if len(entries)>20000: raise HTTPException(413,'Repository has over 20,000 entries. Import rejected, not silently shortened.')
-    if sum(x.file_size for x in entries)>MAX_UNPACKED: raise HTTPException(413,'Expanded repository exceeds 100 MB. Import rejected.')
+    if sum(x.file_size for x in entries)>MAX_UNPACKED: raise HTTPException(413,f'Expanded repository exceeds {MAX_UNPACKED / 1_000_000:g} MB. Import rejected.')
     for entry in entries:
         path='/'.join(entry.filename.split('/')[1:])
         if not path: continue
@@ -242,6 +243,16 @@ class ImportRequest(BaseModel):
     url: str = Field(max_length=250)
 
 
+async def download_archive(response, destination):
+    size = 0
+    async for block in response.aiter_bytes(chunk_size=64 * 1024):
+        size += len(block)
+        if size > MAX_ZIP:
+            raise HTTPException(413, f'Repository archive exceeds {MAX_ZIP / 1_000_000:g} MB. Import rejected, not silently shortened.')
+        destination.write(block)
+    return size
+
+
 @router.post('/import')
 async def import_repo(body: ImportRequest, request: Request):
     guard(request,'import',12)
@@ -254,13 +265,14 @@ async def import_repo(body: ImportRequest, request: Request):
             if r.status_code!=200: raise HTTPException(422,'Public repository not found or default branch unavailable. Private repositories are not supported.')
             sha=r.json().get('sha','')
             if not re.fullmatch('[a-f0-9]{40}',sha): raise HTTPException(502,'Could not pin the repository commit.')
-            async with client.stream('GET',f'https://codeload.github.com/{owner}/{repo}/zip/{sha}') as response:
-                if response.status_code!=200: raise HTTPException(502,'Could not download the public repository archive.')
-                raw=bytearray()
-                async for block in response.aiter_bytes():
-                    raw.extend(block)
-                    if len(raw)>MAX_ZIP: raise HTTPException(413,'Repository archive exceeds 25 MB. Import rejected, not silently shortened.')
-        data=index_archive(bytes(raw),owner,repo,sha)
+            # Spill larger downloads to disk rather than holding multiple copies
+            # of the complete ZIP in memory. Still enforce a hard download budget.
+            with tempfile.SpooledTemporaryFile(max_size=4_000_000, mode='w+b') as archive:
+                async with client.stream('GET',f'https://codeload.github.com/{owner}/{repo}/zip/{sha}') as response:
+                    if response.status_code!=200: raise HTTPException(502,'Could not download the public repository archive.')
+                    await download_archive(response, archive)
+                archive.seek(0)
+                data=index_archive(archive,owner,repo,sha)
         save(data)
         return public(data)
 

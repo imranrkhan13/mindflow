@@ -199,3 +199,42 @@ def test_identifier_acronyms_and_natural_inflections_align():
     assert 'import' in tokens('importing')
     assert 'api' in tokens('resolveAPIKey')
     assert 'request' in tokens('requests')
+
+
+def test_spooled_archive_above_previous_25_mb_limit_is_indexed():
+    import tempfile
+    with tempfile.SpooledTemporaryFile(max_size=1024, mode='w+b') as source:
+        with zipfile.ZipFile(source, 'w', compression=zipfile.ZIP_STORED) as z:
+            z.writestr('repo-sha/assets/large.png', b'x' * 26_000_000)
+            z.writestr('repo-sha/main.ts', 'export const retainedSource = true;')
+        assert source.tell() > 25_000_000
+        assert source.tell() < r.MAX_ZIP
+        source.seek(0)
+        data = r.index_archive(source, 'x', 'y', 'b' * 40)
+    assert data['coverage']['truncated'] is False
+    assert data['files'][0]['text'] == 'export const retainedSource = true;'
+    assert data['omitted'][0]['path'] == 'assets/large.png'
+
+
+def test_stream_download_accepts_exact_budget_and_rejects_overflow(monkeypatch):
+    import asyncio
+    monkeypatch.setattr(r, 'MAX_ZIP', 10)
+    class Response:
+        def __init__(self, blocks): self.blocks = blocks
+        async def aiter_bytes(self, chunk_size):
+            for block in self.blocks: yield block
+    output = io.BytesIO()
+    assert asyncio.run(r.download_archive(Response([b'12345', b'67890']), output)) == 10
+    assert output.getvalue() == b'1234567890'
+    output = io.BytesIO()
+    with pytest.raises(HTTPException) as ex:
+        asyncio.run(r.download_archive(Response([b'12345', b'678901']), output))
+    assert ex.value.status_code == 413
+    assert output.getvalue() == b'12345'
+
+
+def test_expanded_archive_budget_still_applies(monkeypatch):
+    monkeypatch.setattr(r, 'MAX_UNPACKED', 10)
+    with pytest.raises(HTTPException) as ex:
+        r.index_archive(archive({'main.ts': 'x' * 11}), 'x', 'y', 'b' * 40)
+    assert ex.value.status_code == 413
