@@ -392,10 +392,9 @@ async def source(sid: str,path: str):
     return f
 
 
-def retrieve(data,question,limit=12):
-    # Explicit symbol lookup gets an exact whole-index absence check before fuzzy retrieval.
-    explicit=re.search(r'where\s+is\s+`?([A-Za-z_$][\w$]*)`?\s+implemented',question,re.I)
-    if explicit and not any(re.search(r'(?<![\w$])'+re.escape(explicit[1])+r'(?![\w$])',f['text']) for f in data['files']): return []
+def retrieve_raw(data,question,limit=12,cap=38000):
+    """Ranked windows without IDs/URLs, so callers can chain steps and re-retrieve."""
+    if _explicit_missing(data,question): return []
     chunks=build_chunks(data['files'])
     terms=set(tokens(question))-{'how','what','where','when','why','which','does','this','that','the','and','are','for','with','from','can','you','please','work','works','repository','repo','code','actually','here','about','explain'}
     if not terms: return []
@@ -427,7 +426,7 @@ def retrieve(data,question,limit=12):
         # Index everything, but keep model context bounded and disclose retrieval scope.
         # Oversized single-line/minified windows remain viewable in the file inspector.
         size=len(c['text'])
-        if size>10000 or context_bytes+size>38000: continue
+        if size>10000 or context_bytes+size>cap: continue
         if sum(x['path']==c['path'] for x in chosen)>=3: continue
         # Suppress overlapping windows for the same file.
         if any(x['path']==c['path'] and max(0,min(c['end'],x['end'])-max(c['start'],x['start'])+1) / max(1,c['end']-c['start']+1) > .6 for x in chosen): continue
@@ -448,14 +447,33 @@ def retrieve(data,question,limit=12):
         first=min(c['start'] for c in group); last=max(c['end'] for c in group)
         source=next(f for f in data['files'] if f['path']==path)
         text='\n'.join(source['text'].splitlines()[first-1:last])
-        if len(text)<=12000 and sum(len(c['text']) for c in merged)+len(text)<=38000:
+        if len(text)<=12000 and sum(len(c['text']) for c in merged)+len(text)<=cap:
             merged.append({'path':path,'start':first,'end':last,'text':text})
         else: merged.extend(group)
-    chosen=merged
+    return merged
+
+
+def _explicit_missing(data,question):
+    explicit=re.search(r'(?:where\s+is\s+`?([A-Za-z_$][\w$]*)`?\s+implemented)|(?:how\s+(?:do|can|should)\s+i\s+(?:build|implement|add|create)\s+(?:a\s+|an\s+|the\s+)?`?([A-Za-z_$][\w$]{2,})`?)',question,re.I)
+    if not explicit: return False
+    symbol=explicit[1] or explicit[2]
+    if not symbol or not re.fullmatch(r'[A-Za-z_$][\w$]*',symbol): return False
+    # A plain English word ("a", "search") is not a symbol claim: only names with
+    # an identifier shape (snake, camel, ALLCAPS, underscore) get the hard check.
+    if not re.search(r'[_$]|[a-z][A-Z]',symbol) and symbol.lower()==symbol: return False
+    return not any(re.search(r'(?<![\w$])'+re.escape(symbol)+r'(?![\w$])',f['text']) for f in data['files'])
+
+
+def with_ids(data,chosen):
+    chosen=[dict(c) for c in chosen]
     for i,c in enumerate(chosen):
         c['id']=f'S{i+1}'
         c['url']=f"{data['url']}/blob/{data['sha']}/{quote(c['path'],safe='/')}#L{c['start']}-L{c['end']}"
     return chosen
+
+
+def retrieve(data,question,limit=12):
+    return with_ids(data,retrieve_raw(data,question,limit))
 
 
 def evidence_graph(data, snippets):
@@ -757,6 +775,225 @@ async def pull_request(sid: str,body: PullRequestRequest,request: Request):
                               'elapsed':round(time.time()-started,1),'provider':'openrouter/free'})
         yield event('done',{'provider':'openrouter/free','grounded':True,'elapsed':round(time.time()-started,1)})
     return StreamingResponse(stream(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+
+# ── "How do I build this feature?" ─────────────────────────────────────────
+# A build blueprint is assembled deterministically from the snapshot: the files
+# that implement a feature, their observed import order, the exact excerpt and
+# anchor for each step, and the file the step belongs in. The model only writes
+# prose around that skeleton, so steps, order and lines cannot be invented.
+
+STOPWORDS={'a','an','the','my','our','this','that','these','those','it','its','me','i','you','we',
+           'how','do','does','did','can','should','would','could','to','in','into','for','of','on',
+           'with','and','or','by','using','use','build','implement','add','create','make','write',
+           'new','own','feature','features','app','application','project','code','simple','basic',
+           'like','similar','support','supporting','work','works','working','need','want','help'}
+BUILD_VERBS={'build','implement','add','create','make','write','support','replicate','copy','recreate','ship'}
+MIN_STEPS=3
+MAX_STEPS=9
+STEP_BYTES=650
+
+
+def build_intent(question):
+    text=(question or '').strip()
+    if not re.search(r'\b(how)\b.*\b(build|implement|add|create|make|write|support|replicate|recreate|ship|do\s+i|would\s+i|can\s+i)\b',text,re.I) \
+       and not re.search(r'\b(build|implement|add|create)\b.*\b(from\s+scratch|myself|step\s+by\s+step)\b',text,re.I):
+        return ''
+    # The noun phrase after the verb is the feature to look for; fall back to the
+    # whole question so "how do I build this feature" still retrieves something.
+    match=re.search(r'\b(?:build|implement|add|create|make|write|support|replicate|recreate|ship)\s+(?:a\s+|an\s+|the\s+|my\s+|our\s+|own\s+)?(.+)$',text,re.I)
+    feature=(match[1] if match else text).strip(' ?.!')
+    words=[w for w in tokens(feature) if w not in STOPWORDS and len(w)>2]
+    # Drop list glue so "upload and drag and drop" keeps its real words only.
+    words=[w for w in words if w not in {'and','drop'}]
+    return ' '.join(dict.fromkeys(words))
+
+
+def _declarations(text):
+    """Executable names in a window, so steps can point at something concrete."""
+    out=[]
+    for a,b,c in re.findall(r'(?:^|\s)(?:async\s+)?def\s+([A-Za-z_$][\w$]*)|(?:^|\s)(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)|(?:^|\s)(?:export\s+)?(?:const|let|class)\s+([A-Za-z_$][\w$]*)',text,re.M):
+        name=a or b or c
+        if name not in {'if','for','while','switch','catch','function'}: out.append(name)
+    return list(dict.fromkeys(out))
+
+
+def _trim_to_lines(text,start,budget):
+    """An excerpt is always real file lines, never a mid-line cut claimed as exact."""
+    lines=text.splitlines()
+    kept=[]; size=0
+    for offset,line in enumerate(lines):
+        if kept and size+len(line)+1>budget: break
+        kept.append(line); size+=len(line)+1
+    return '\n'.join(kept), start+len(kept)-1
+
+
+def _route_hint(text):
+    for pattern in (r"""(?:\b(?:get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"])""",
+                    r"""@\w+\.(?:get|post|put|patch|delete)\(\s*['"]([^'"]+)['"]""",
+                    r"""(?:path|route)\s*[:=]\s*['"]([^'"]+)['"]"""):
+        match=re.search(pattern,text,re.I)
+        if match: return match[1]
+    return ''
+
+
+def plan_steps(data,feature,limit=MAX_STEPS):
+    chunks=retrieve_raw(data,feature,limit=40,cap=1_000_000)
+    if not chunks: return [], 0
+    # Group the ranked windows per file; the feature lives in a handful of files.
+    by_file={}
+    for chunk in chunks:
+        by_file.setdefault(chunk['path'],[]).append(chunk)
+    paths=list(by_file)
+    known={f['path'] for f in data['files']}
+    # Observed dependency order: a file comes after the files it imports inside
+    # the retrieved set. Cycles fall back to retrieval rank.
+    deps={p:{e['target'] for e in data['edges'] if e['source']==p and e['target'] in known} & set(paths) for p in paths}
+    order=[]; remaining=list(paths)
+    while remaining:
+        ready=[p for p in remaining if not (deps[p] & set(remaining))]
+        nxt=ready[0] if ready else remaining[0]
+        order.append(nxt); remaining.remove(nxt)
+    steps=[]
+    for path in order:
+        windows=by_file[path]
+        name=PurePosixPath(path).name
+        imports=sorted({e['target'] for e in data['edges'] if e['source']==path and e['target'] in known})
+        used_by=sorted({e['source'] for e in data['edges'] if e['target']==path})
+        for chunk in windows[:2]:
+            text,end=_trim_to_lines(chunk['text'],chunk['start'],STEP_BYTES)
+            if not text.strip(): continue
+            steps.append({'title':f'Add {name}',
+                          'path':path,
+                          'declarations':_declarations(text)[:6],
+                          'anchor':(chunk['start'],end),
+                          'excerpt':text,
+                          'language':PurePosixPath(path).suffix.lstrip('.') or 'text',
+                          'imports':imports,
+                          'used_by':used_by,
+                          'route':_route_hint(text),
+                          'depends_on':sorted(deps[path]),
+                          'reason':f'Retrieved for “{feature}”'})
+            break
+        if len(steps)>=limit: break
+    # Docs never become numbered build steps: a README is not implementation.
+    steps=[step for step in steps if not step['path'].lower().endswith(('.md','.mdx','.txt','.rst'))]
+    # Dependency call-outs are described, never generated.
+    for step in steps:
+        step['wiring']=[d for d in step['imports'] if d in {s['path'] for s in steps}]
+    return steps,len(chunks)
+
+
+def build_contract(data,question,max_steps=6):
+    feature=build_intent(question)
+    if not feature:
+        return {'ok':False,'reason':'not_a_build_question'}
+    steps,chunks=plan_steps(data,feature,max_steps)
+    if len(steps)<MIN_STEPS:
+        return {'ok':False,'reason':'insufficient_source','feature':feature,'steps':len(steps),'chunks':chunks}
+    for index,step in enumerate(steps):
+        if not re.search(r'(?<!\w)'+re.escape(feature.split()[0])+r'(?!\w)',step['excerpt'],re.I):
+            step['reason']=f'Imported by a retrieved file for “{feature}”'
+    return {'ok':True,'feature':feature,'steps':steps,'chunks':chunks}
+
+
+def build_prompt(question,steps,feature):
+    skeleton='\n'.join(
+        f"STEP {i+1}: file {s['path']} lines {s['anchor'][0]}-{s['anchor'][1]}"
+        f" · declarations: {', '.join(s['declarations']) or 'none detected'}"
+        f" · this file imports: {', '.join(s['imports']) or 'nothing in the snapshot'}"
+        f" · imported by: {', '.join(s['used_by']) or 'nothing detected'}"
+        + (f" · route: {s['route']}" if s['route'] else '')
+        for i,s in enumerate(steps))
+    return (f'{question}\n'
+            'Produce a BUILD BLUEPRINT for building this feature from scratch, using ONLY the numbered source excerpts. '
+            'The excerpts are shown in the order the import graph supports: earlier files are depended on by later ones. '
+            'Do not invent steps, files, libraries, endpoints or configuration that is not in the excerpts. '
+            'If a normal implementation would need something the excerpts do not contain (a database table, a config value, a dependency), '
+            'say exactly that and mark it "not in this snapshot" instead of guessing. '
+            f'The feature under discussion is: {feature}. '
+            'Answer with these headings, in this order, and nothing before them:\n'
+            '### What you are building\nOne paragraph, plain language.\n'
+            '### Steps\nFor each step: "**Step N — <name>** (`path` lines A-B)". Then 2-4 sentences of what to build and why it goes here, '
+            'naming the declarations from that step. Cite the step source IDs like [S1]. Keep the steps in the given order.\n'
+            '### Code\nFor each step, a fenced code block with the language, then a one-line note saying whether it is copied '
+            'from the snapshot or a skeleton you must fill in. Only show code that appears in the excerpts; never invent an implementation.\n'
+            '### Wiring\nHow the steps connect: which file imports which, and what each route or entry point supplies.\n'
+            '### Gaps\nWhat a real build needs that the snapshot does not show, each on its own line.\n'
+            f'Skeleton derived from the snapshot, do not reorder:\n{skeleton}\n'
+            'Cite only the source IDs that contain the claim. Keep the whole answer under 900 words.')
+
+
+def blueprint_entries(data,steps):
+    return [{'id':f'S{i+1}','path':s['path'],'start':s['anchor'][0],'end':s['anchor'][1],'text':s['excerpt'],
+             'url':f"{data['url']}/blob/{data['sha']}/{quote(s['path'],safe='/')}#L{s['anchor'][0]}-L{s['anchor'][1]}",
+             'declarations':s['declarations'],'reason':s['reason']} for i,s in enumerate(steps)]
+
+
+def build_sections(markdown):
+    """Split the model's answer into the fixed sections, keeping headings we asked for."""
+    sections=[]; current={'title':'Overview','body':''}
+    for line in (markdown or '').splitlines():
+        heading=re.match(r'^\s*#{2,4}\s+(.+?)\s*$',line)
+        if heading:
+            if current['body'].strip(): sections.append(current)
+            current={'title':heading[1],'body':''}
+            continue
+        current['body']+=line+'\n'
+    if current['body'].strip(): sections.append(current)
+    return sections
+
+
+class BuildRequest(BaseModel):
+    question: str = Field(min_length=4,max_length=600)
+    mode: str = 'build'
+
+
+@router.post('/{sid}/build')
+async def build(sid: str,body: BuildRequest,request: Request):
+    guard(request,'build',20)
+    data=await asyncio.to_thread(load,sid)
+    async def stream():
+        started=time.time()
+        yield event('status',{'text':'Working out which files this feature would need…'})
+        contract=await asyncio.to_thread(build_contract,data,body.question)
+        if not contract['ok']:
+            if contract['reason']=='not_a_build_question':
+                yield event('error',{'text':'This is a how-to-build request only for explicit build questions, for example "How do I build a login route?". Ask a normal question in Ask.'});return
+            yield event('error',{'text':f"I could only find {contract['steps']} matching source file(s) for “{contract['feature']}”, which is not enough to outline a build with confidence. Name the feature the way the code does (a function, a module or a route) and I will not guess the rest."});return
+        steps=contract['steps']
+        roots=foundation_count(steps)
+        yield event('status',{'text':f'Planning {len(steps)} steps from consistent import order…'})
+        snippets=with_ids(data,blueprint_entries(data,steps))
+        yield event('build_plan',{'feature':contract['feature'],'steps':steps,'chunks':contract['chunks'],'foundation':roots})
+        yield event('sources',{'sources':snippets,'searched_files':len(data['files']),'commit':data['sha']})
+        graph=evidence_graph(data,snippets)
+        for node in graph['nodes']:
+            yield event('node',node); await asyncio.sleep(0)
+        for edge in graph['edges']: yield event('edge',edge)
+        yield event('graph_info',{'text':graph['kind']})
+        if not settings.openrouter_api_key:
+            yield event('error',{'text':'No free model key is configured. The step plan, anchors and code excerpts above are real; the written blueprint needs the free route.'});return
+        yield event('status',{'text':'Free model is turning the plan into a blueprint…'})
+        try:
+            async with await free_client() as client:
+                if not await free_route_verified(client):
+                    yield event('error',{'text':'Zero-price route could not be verified. No model request was sent.'});return
+                text=await answer_text(client,build_prompt(body.question,steps,contract['feature']),snippets,effort='low')
+        except ValueError:
+            yield event('invalid',{'text':'The free model did not return a correctly cited blueprint and its draft was hidden. The step plan and code above are unaffected.'});return
+        except (httpx.HTTPError,KeyError,IndexError):
+            yield event('invalid',{'text':'The free model stream failed. No paid fallback was used; the plan and excerpts above are real.'});return
+        yield event('blueprint',{'answer':text,'sections':build_sections(text),'steps':steps,
+                                 'feature':contract['feature'],'foundation':roots,'elapsed':round(time.time()-started,1)})
+        yield event('done',{'provider':'openrouter/free','grounded':True,'elapsed':round(time.time()-started,1)})
+    return StreamingResponse(stream(),media_type='text/event-stream',headers={'Cache-Control':'no-cache','X-Accel-Buffering':'no'})
+
+
+def foundation_count(steps):
+    """Steps that depend on nothing else in the plan: where a build starts."""
+    targets={s['path'] for s in steps}
+    return len([s for s in steps if not (set(s['depends_on']) & targets)]) or len(steps)
 
 
 @router.post('/{sid}/ask')

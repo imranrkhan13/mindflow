@@ -67,7 +67,61 @@ function Logo() {
     </span>
   );
 }
-function Answer({ text, sources, onSource }) {
+/* Verified build plan, shown before the prose so the order is never the
+   model's invention. Clicking a step opens the exact lines. */
+function PlanSteps({ plan, sources, onSource }) {
+  const [open, setOpen] = useState(true);
+  const steps = plan?.steps || [];
+  if (!steps.length) return null;
+  return (
+    <div className="mf-plan">
+      <button className="mf-plan-head" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <GitBranch size={13} />
+        <span>
+          {steps.length}-step build plan
+          {plan.feature ? <> for <em>{plan.feature}</em></> : null}
+        </span>
+        <small>{open ? "hide" : "show"}</small>
+      </button>
+      {open && (
+        <ol className="mf-plan-steps">
+          {steps.map((step, i) => {
+            const snippet = (sources || []).find(
+              (s) => s.path === step.path && s.start === step.anchor[0],
+            );
+            return (
+              <li key={`${step.path}-${step.anchor[0]}`}>
+                <span className="n">{i + 1}</span>
+                <div className="body">
+                  <p className="file">
+                    <code>{step.path}</code>
+                    <button
+                      className="lines"
+                      onClick={() => onSource(step.path, step.anchor[0], step.anchor[1])}
+                    >
+                      L{step.anchor[0]}-{step.anchor[1]}
+                    </button>
+                    {snippet && <span className="cite">{snippet.id}</span>}
+                  </p>
+                  {step.declarations?.length > 0 && (
+                    <p className="decl">{step.declarations.map((d) => <code key={d}>{d}</code>)}</p>
+                  )}
+                  <p className="wire">
+                    {step.imports?.length ? `imports ${step.imports.join(", ")}` : "no in-snapshot imports"}
+                    {step.used_by?.length ? ` · used by ${step.used_by.slice(0, 3).join(", ")}` : ""}
+                    {step.route ? ` · route ${step.route}` : ""}
+                  </p>
+                </div>
+              </li>
+            );
+          })}
+        </ol>
+      )}
+    </div>
+  );
+}
+
+function Answer({ text, sources, onSource, blueprint }) {
   function inline(value) {
     return value
       .split(/(\[S\d+\]|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g)
@@ -106,34 +160,34 @@ function Answer({ text, sources, onSource }) {
         return <span key={i}>{part}</span>;
       });
   }
+  // Code blocks are grouped so they can be labelled with language, anchored to
+  // the real file lines, and copied — a run of grey lines is not usable code.
+  const lines = text.split("\n");
+  const blocks = [];
   let fenced = false;
+  let currentBlock = null;
+  lines.forEach((line, i) => {
+    if (/^\s*```/.test(line)) {
+      if (fenced) { blocks.push(currentBlock); currentBlock = null; }
+      else currentBlock = { start: i, lang: line.replace(/^\s*```/, "").trim(), code: [] };
+      fenced = !fenced;
+      return;
+    }
+    if (fenced) currentBlock.code.push(line);
+    else blocks.push({ line, index: i });
+  });
+  if (currentBlock) blocks.push(currentBlock);
   return (
     <div className="mf-answer" style={{ whiteSpace: "normal" }}>
-      {text.split("\n").map((line, i) => {
-        if (/^\s*```/.test(line)) {
-          fenced = !fenced;
-          return null;
-        }
-        if (fenced)
-          return (
-            <div
-              key={i}
-              style={{
-                fontFamily: "monospace",
-                whiteSpace: "pre-wrap",
-                background: "#f3ece2",
-                padding: "2px 8px",
-              }}
-            >
-              {line}
-            </div>
-          );
-        if (!line.trim()) return <div key={i} style={{ height: 8 }} />;
+      {blocks.map((block, i) => {
+        if (block.code) return <CodeBlock key={`c${i}`} block={block} blueprint={blueprint} onSource={onSource} inline={inline} />;
+        const line = block.line;
+        if (!line.trim()) return <div key={block.index} style={{ height: 8 }} />;
         const heading = line.match(/^#{1,6}\s+(.+)/);
         if (heading)
           return (
             <h4
-              key={i}
+              key={block.index}
               style={{
                 fontSize: 13,
                 fontWeight: 650,
@@ -147,7 +201,7 @@ function Answer({ text, sources, onSource }) {
         if (/^\s*[-*]\s+/.test(line))
           return (
             <div
-              key={i}
+              key={block.index}
               style={{ paddingLeft: 13, textIndent: -10, margin: "4px 0" }}
             >
               • {inline(line.replace(/^\s*[-*]\s+/, ""))}
@@ -155,14 +209,14 @@ function Answer({ text, sources, onSource }) {
           );
         if (/^\s*\d+[.)]\s+/.test(line))
           return (
-            <div key={i} style={{ paddingLeft: 12, margin: "4px 0" }}>
+            <div key={block.index} style={{ paddingLeft: 12, margin: "4px 0" }}>
               {inline(line)}
             </div>
           );
         if (/^\s*---+\s*$/.test(line))
           return (
             <hr
-              key={i}
+              key={block.index}
               style={{
                 border: 0,
                 borderTop: "1px solid #e8e1d4",
@@ -171,7 +225,7 @@ function Answer({ text, sources, onSource }) {
             />
           );
         return (
-          <div key={i} style={{ margin: "3px 0" }}>
+          <div key={block.index} style={{ margin: "3px 0" }}>
             {inline(line)}
           </div>
         );
@@ -179,6 +233,47 @@ function Answer({ text, sources, onSource }) {
     </div>
   );
 }
+function CodeBlock({ block, blueprint, onSource, inline }) {
+  const [copied, setCopied] = useState(false);
+  const code = block.code.join("\n");
+  // Match the block back to a plan step by a declaration it contains, so the
+  // snippet can be anchored to the file and lines it really came from.
+  const step = (blueprint?.steps || []).find(
+    (s) => (s.declarations || []).some((d) => code.includes(d)) && s.language === (block.lang || s.language),
+  ) || (blueprint?.steps || []).find((s) => (s.declarations || []).some((d) => code.includes(d)));
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(code);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  }
+  return (
+    <div className="mf-codeblock">
+      <div className="mf-codeblock-head">
+        <span className="lang">{block.lang || "code"}</span>
+        {step && (
+          <button className="anchor" onClick={() => onSource(step.path, step.anchor[0], step.anchor[1])}>
+            <FileCode2 size={11} />
+            {step.path} L{step.anchor[0]}-{step.anchor[1]}
+          </button>
+        )}
+        <button className="copy" onClick={copy}>{copied ? "Copied" : "Copy"}</button>
+      </div>
+      <pre>{code}</pre>
+    </div>
+  );
+}
+
+function looksLikeBuildQuestion(text) {
+  const value = (text || "").trim();
+  if (!/(^|\s)how\s+(do|can|would|should)\s+(i|we)\b/i.test(value) &&
+      !/build\s+(this|that|it|a|an|my|our)\b/i.test(value)) return false;
+  return /\b(build|implement|add|create|make|write|support|replicate|recreate|ship)\b/i.test(value);
+}
+
 function formatMs(ms) {
   return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
 }
@@ -196,6 +291,9 @@ function StarterPrompts({ project, selected, onPick, onAsk }) {
       entry ? `Walk me through ${entry.path}, starting at its top-level definitions.` : null,
       firstTest ? `What does ${firstTest.path} check, and which source files does it import?` : null,
       "Trace the main data flow across files.",
+      selected
+        ? `How do I build a feature modelled on ${selected}?`
+        : "How do I build a feature like the main entry point here?",
       "Where are errors handled, and what tests cover them?",
     ].filter(Boolean);
   }, [project]);
@@ -205,13 +303,7 @@ function StarterPrompts({ project, selected, onPick, onAsk }) {
       <div className="mf-starters-head">
         <span className="mf-eyebrow">TRY ONE</span>
         <span>
-          {selected ? (
-            <>
-              context: <code>{selected.split("/").pop()}</code>
-            </>
-          ) : (
-            "tap to fill the box, then send"
-          )}
+          {"tap to fill the box, then send · build questions get a step-by-step plan"}
         </span>
       </div>
       {prompts.map((q, i) => (
@@ -724,14 +816,17 @@ function RepositoryApp() {
       );
     controller.current = new AbortController();
     let completed = false;
+    // "How do I build X?" goes to the blueprint endpoint: it returns a verified
+    // step plan and snippets before the model writes anything.
+    const endpoint = looksLikeBuildQuestion(question) ? "build" : "ask";
     try {
-      const response = await fetch(`${BASE}/${project.id}/ask`, {
+      const response = await fetch(`${BASE}/${project.id}/${endpoint}`, {
         ...post({ question: contextualQuestion }),
         signal: controller.current.signal,
       });
       if (!response.ok) {
         const d = await response.json().catch(() => ({}));
-        throw new Error(apiErrorMessage(response.status, d.detail, `/api/repository/${project.id}/ask`));
+        throw new Error(apiErrorMessage(response.status, d.detail, `/api/repository/${project.id}/${endpoint}`));
       }
       const reader = response.body.getReader(),
         decoder = new TextDecoder();
@@ -749,6 +844,24 @@ function RepositoryApp() {
           if (!raw) continue;
           const data = JSON.parse(raw);
           if (type === "status") setStatus(data.text);
+          if (type === "build_plan") {
+            update({ plan: data, kind: "build" });
+            setStatus(
+              data.steps?.length
+                ? `Plan ready: ${data.steps.length} steps. Free model is writing the blueprint…`
+                : status,
+            );
+          }
+          if (type === "blueprint") {
+            update({
+              text: data.answer,
+              sections: data.sections,
+              plan: { ...(data.plan || {}), steps: data.steps, feature: data.feature, foundation: data.foundation },
+              kind: "build",
+              totalMs: Date.now() - startedAt,
+            });
+            setStatus("Blueprint ready — each step is linked to real lines");
+          }
           if (type === "sources") {
             currentSources = data.sources;
             setSources(data.sources);
@@ -1208,13 +1321,19 @@ function RepositoryApp() {
                         <RetrievalStages status={status} sources={m.sources} />
                       )}
                       {m.role === "assistant" && m.graph && <button disabled={busy} className={`mf-view-map ${graphId === m.id ? "active" : ""}`} onClick={() => { setNodes(m.graph.nodes); setEdges(m.graph.edges); setGraphId(m.id); setFitKey(k => k + 1); }}><GitBranch size={14} />{graphId === m.id ? "Viewing answer map" : "View answer map"}</button>}
+                      {m.role === "assistant" && m.plan?.steps?.length ? (
+                        <PlanSteps plan={m.plan} sources={m.sources || []} onSource={openSource} />
+                      ) : null}
                       <Answer
                         text={
                           m.text ||
-                          "Looking for the code behind your question..."
+                          (m.plan
+                            ? "Planning the steps from real source…"
+                            : "Looking for the code behind your question...")
                         }
                         sources={m.sources || []}
                         onSource={openSource}
+                        blueprint={m.plan?.steps ? m.plan : null}
                       />
                       {m.role === "assistant" &&
                         !m.provisional &&

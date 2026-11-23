@@ -543,3 +543,82 @@ def test_model_payload_cannot_override_model_and_cites_diff_entries():
     assert p['stream'] is True
     prompt = r.review_prompt('risk', r.review_clusters(r.diff_files(PR_PATCH)), 'o/r', 'd' * 40)
     assert 'D1' in prompt and 'most likely to break' in prompt and 'o/r at commit dddddddd' in prompt
+
+
+def test_build_intent_only_fires_for_build_questions():
+    assert r.build_intent('How do I build a login route?')
+    assert r.build_intent('How would I implement drag and drop uploads?')
+    assert r.build_intent('What would I need to build webhooks from scratch?')
+    assert r.build_intent('What does send_chat do?') == ''
+    assert r.build_intent('Where is save_message implemented?') == ''
+
+
+def build_sample():
+    files = {
+        'app/store.py': 'def save_message(message):\n    return message\n',
+        'src/chat.py': 'from app.store import save_message\n\ndef send_chat(message):\n    return save_message(message)\n',
+        'src/client.js': 'export function send(x) { return fetch(x) }\n',
+        'src/ui.jsx': "import { send } from './client'\nexport const Chat = () => send('hello')\n",
+        'README.md': '# A chat application with save_message and send_chat\n',
+    }
+    return r.index_archive(archive(files), 'o', 'r', 'd' * 40)
+
+
+def test_build_plan_orders_by_imports_and_skips_docs():
+    data = build_sample()
+    contract = r.build_contract(data, 'How do I build a feature where chat sends a message to the store?')
+    assert contract['ok'] is True
+    paths = [s['path'] for s in contract['steps']]
+    assert 'README.md' not in paths
+    # The store is imported by the chat module, so it must come first.
+    assert paths.index('app/store.py') < paths.index('src/chat.py')
+    chat = next(s for s in contract['steps'] if s['path'] == 'src/chat.py')
+    assert 'send_chat' in chat['declarations']
+    assert chat['imports'] == ['app/store.py']
+    assert chat['wiring'] == ['app/store.py']
+
+
+def test_build_excerpts_are_exact_whole_lines():
+    data = build_sample()
+    contract = r.build_contract(data, 'How do I build a chat send flow?')
+    originals = {f['path']: f['text'] for f in data['files']}
+    for step in contract['steps']:
+        start, end = step['anchor']
+        assert step['excerpt'] == '\n'.join(originals[step['path']].splitlines()[start - 1:end])
+    entries = r.blueprint_entries(data, contract['steps'])
+    assert [e['id'] for e in entries][:2] == ['S1', 'S2']
+    assert all('/blob/' + data['sha'] + '/' in e['url'] for e in entries)
+
+
+def test_build_refuses_when_the_feature_is_absent():
+    data = build_sample()
+    contract = r.build_contract(data, 'How do I build QZXVATeleportRabbit32789?')
+    assert contract['ok'] is False and contract['reason'] == 'insufficient_source'
+
+
+def test_build_sections_keep_the_requested_order():
+    text = '### What you are building\nOne line.\n### Steps\n**Step 1** [S1]\n### Code\n```py\nx = 1\n```\n### Gaps\n- none shown'
+    sections = r.build_sections(text)
+    assert [s['title'] for s in sections] == ['What you are building', 'Steps', 'Code', 'Gaps']
+    assert 'x = 1' in sections[2]['body']
+
+
+def test_build_endpoint_without_model_still_returns_the_plan(monkeypatch):
+    data = build_sample(); r.save(data)
+    monkeypatch.setattr(r.settings, 'openrouter_api_key', None)
+    app = FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        text = client.post(f"/api/repository/{data['id']}/build",
+                           json={'question': 'How do I build a chat send flow?'}).text
+    assert 'event: build_plan' in text
+    assert 'event: sources' in text
+    assert 'No free model key is configured' in text
+    assert 'event: blueprint' not in text
+
+
+def test_build_endpoint_rejects_non_build_questions(monkeypatch):
+    data = sample(); r.save(data)
+    app = FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        text = client.post(f"/api/repository/{data['id']}/build", json={'question': 'What does chat do?'}).text
+    assert 'explicit build questions' in text
