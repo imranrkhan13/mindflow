@@ -31,7 +31,7 @@ import Landing from "./pages/Landing.jsx";
 import VideoPanel from "./components/VideoPanel.jsx";
 import ReviewPanel from "./components/ReviewPanel.jsx";
 import NarrationPlayer from "./components/NarrationPlayer.jsx";
-import { requestNarration, narrationText } from "./lib/narration.js";
+import { requestNarrationLong, narrationText } from "./lib/narration.js";
 import {
   BookOpen,
   MessageSquare,
@@ -467,10 +467,13 @@ function Speech({ text }) {
   const [voice, setVoice] = useState("friendly"),
     [busy, setBusy] = useState(false),
     [audio, setAudio] = useState(""),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [progress, setProgress] = useState("");
   const ref = useRef("");
+  const controller = useRef(null);
   useEffect(
     () => () => {
+      controller.current?.abort();
       if (ref.current) URL.revokeObjectURL(ref.current);
     },
     [],
@@ -478,17 +481,26 @@ function Speech({ text }) {
   async function speak() {
     setBusy(true);
     setError("");
+    setProgress("Generating audio…");
+    controller.current?.abort();
+    controller.current = new AbortController();
     try {
       const script = narrationText(text);
-      if (script.length > 6000) throw new Error("This answer exceeds the voice service’s 6,000-character limit. Ask for a shorter summary to hear the complete answer.");
-      const blob = await requestNarration(script, voice);
+      // Long answers are split into short sections instead of being refused:
+      // Kokoro reads short input more evenly and each part stays under the
+      // server's 6,000-character limit.
+      const blob = await requestNarrationLong(script, voice, controller.signal, (done, total) => {
+        if (total > 1) setProgress(`Reading part ${done} of ${total}…`);
+        else setProgress("Generating audio…");
+      });
       if (ref.current) URL.revokeObjectURL(ref.current);
       ref.current = URL.createObjectURL(blob);
       setAudio(ref.current);
     } catch (e) {
-      setError(e.message);
+      if (e.name !== "AbortError") setError(e.message);
     } finally {
       setBusy(false);
+      setProgress("");
     }
   }
   return (
@@ -508,7 +520,7 @@ function Speech({ text }) {
         </select>
         <button disabled={busy} onClick={speak}>
           <Volume2 size={13} />
-          {busy ? "Making audio..." : "Listen"}
+          {busy ? progress || "Making audio..." : audio ? "Listen again" : "Listen"}
         </button>
       </div>
       {audio && (
@@ -516,7 +528,8 @@ function Speech({ text }) {
       )}
       {error && <p role="alert">{error}</p>}
       <small>
-        Kokoro voice · balanced audio levels · WAV download. Listening pace affects playback only.
+        Kokoro voice · balanced levels · long answers are read in short sections so nothing is
+        refused. Listening pace affects playback only.
       </small>
     </div>
   );

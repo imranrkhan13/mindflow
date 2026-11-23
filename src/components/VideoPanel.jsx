@@ -7,6 +7,11 @@ import {
   Loader2,
   AlertTriangle,
   Volume2,
+  CheckCircle2,
+  Clock,
+  ChevronLeft,
+  ChevronRight,
+  RefreshCw,
 } from "lucide-react";
 import {
   startVideoGeneration,
@@ -14,14 +19,19 @@ import {
   videoDownloadUrl,
 } from "../lib/api.js";
 
-import { requestNarration } from "../lib/narration.js";
+import { cachedNarration, warmNarration } from "../lib/narration.js";
 import NarrationPlayer from "./NarrationPlayer.jsx";
 
 const VOICES = [
-  ["narrator", "Michael, clear narrator"],
-  ["friendly", "Heart, warm and natural"],
-  ["calm", "Emma, calm British"],
+  ["friendly", "Heart · warm and natural"],
+  ["narrator", "Michael · clear narrator"],
+  ["calm", "Emma · calm British"],
 ];
+// One short, representative line. Warmed for every voice so a click plays
+// immediately instead of waiting ~3 s for Kokoro.
+const SAMPLE_TEXT =
+  "Here is how this works: a request arrives, the code checks it, then the response goes back.";
+const JOB_KEY = "mindflow.video.job";
 export default function VideoPanel({ projectId, node, standalone }) {
   const [mode, setMode] = useState("walkthrough"),
     [prompt, setPrompt] = useState(
@@ -36,6 +46,11 @@ export default function VideoPanel({ projectId, node, standalone }) {
     [preview, setPreview] = useState(""),
     [previewBusy, setPreviewBusy] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1);
+  const [previewVoiceId, setPreviewVoiceId] = useState("");
+  const [jobStartedAt, setJobStartedAt] = useState(0);
+  const [elapsed, setElapsed] = useState(0);
+  const [resumeAvailable, setResumeAvailable] = useState("");
+  const [playing, setPlaying] = useState(false);
   const videoRef = useRef(null);
   const previewController = useRef(null);
   const cancel = useRef(false),
@@ -49,14 +64,39 @@ export default function VideoPanel({ projectId, node, standalone }) {
     }; },
     [],
   );
-  async function previewVoice() {
+
+  // Fetch a sample for every voice in the background, once. Loading it after a
+  // click was the main reason previews felt broken.
+  useEffect(() => { warmNarration(SAMPLE_TEXT, VOICES.map(([id]) => id)); }, []);
+
+  // Reconnect to a render that was started before this tab reloaded. The server
+  // keeps the job, so a reload must not look like "nothing happened".
+  useEffect(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(JOB_KEY) || "null");
+      // A job older than the server's render window cannot still exist.
+      if (saved?.job_id && saved.project === projectId && Date.now() - (saved.at || 0) < 30 * 60 * 1000)
+        setResumeAvailable(saved.job_id);
+      else if (saved?.project === projectId) localStorage.removeItem(JOB_KEY);
+    } catch { /* ignore corrupt storage */ }
+  }, [projectId]);
+
+  // Elapsed timer for a running render: honest, unlike a frozen percentage.
+  useEffect(() => {
+    if (status !== "running" || !jobStartedAt) { setElapsed(0); return; }
+    const id = setInterval(() => setElapsed(Date.now() - jobStartedAt), 1000);
+    return () => clearInterval(id);
+  }, [status, jobStartedAt]);
+
+  async function previewVoice(nextVoice = voice) {
     setPreviewBusy(true);
+    setPreviewVoiceId(nextVoice);
     setError("");
     try {
       previewController.current?.abort();
       const controller = new AbortController();
       previewController.current = controller;
-      const b = await requestNarration("Let’s follow the code, one step at a time. First, a request reaches the entry point. Next, the application processes it and returns a response. Open the source to explore the details.", voice, controller.signal);
+      const b = await cachedNarration(SAMPLE_TEXT, nextVoice);
       if (cancel.current || controller.signal.aborted) return;
       if (object.current) URL.revokeObjectURL(object.current);
       object.current = URL.createObjectURL(b);
@@ -67,6 +107,83 @@ export default function VideoPanel({ projectId, node, standalone }) {
       setPreviewBusy(false);
     }
   }
+
+  function pickVoice(nextVoice) {
+    previewController.current?.abort();
+    setVoice(nextVoice);
+    setPreview("");
+    if (!preview) return;
+    previewVoice(nextVoice);
+  }
+
+  function stepVoice(direction) {
+    const index = VOICES.findIndex(([id]) => id === voice);
+    pickVoice(VOICES[(index + direction + VOICES.length) % VOICES.length][0]);
+  }
+
+  async function resumeJob(jobId) {
+    localStorage.setItem(JOB_KEY, JSON.stringify({ job_id: jobId, project: projectId, at: Date.now() }));
+    setJob(jobId);
+    setResumeAvailable("");
+    setStatus("running");
+    setJobStartedAt(Date.now() - 1000);
+    setStage("Reconnecting to the running render");
+    setProgress(0);
+    try {
+      const first = await getVideoStatus(jobId);
+      if (first.status === "done") {
+        setStatus("done");
+        localStorage.removeItem(JOB_KEY);
+        return;
+      }
+      if (first.status === "error" || first.status === "missing" || !first.status) {
+        localStorage.removeItem(JOB_KEY);
+        setStatus("idle");
+        setError("That render is no longer on the server. Start a new one.");
+        return;
+      }
+      // Reset the clock to the server's reported progress instead of guessing.
+      setJobStartedAt(Date.now());
+      setStage(first.stage || "Rendering");
+      setProgress(Math.max(0, Math.min(1, Number(first.progress) || 0)));
+    } catch (e) {
+      localStorage.removeItem(JOB_KEY);
+      setStatus("idle");
+      setError(`Could not reconnect: ${e.message}`);
+      return;
+    }
+    try {
+      await poll(jobId);
+    } catch (e) {
+      setStatus("error");
+      setError(e.message);
+    }
+  }
+
+  async function poll(job_id) {
+    const deadline = Date.now() + 12 * 60 * 1000;
+    while (!cancel.current && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 3000));
+      if (cancel.current) return;
+      const s = await getVideoStatus(job_id);
+      setStage(s.stage);
+      setProgress(Math.max(0, Math.min(1, Number(s.progress) || 0)));
+      if (s.status === "done") {
+        setStatus("done");
+        localStorage.removeItem(JOB_KEY);
+        return;
+      }
+      if (s.status === "error") {
+        localStorage.removeItem(JOB_KEY);
+        throw new Error(s.error || "Video generation failed");
+      }
+    }
+    if (!cancel.current)
+      throw new Error(
+        "This render is taking longer than 12 minutes. The job may still be finishing. Refreshing does not cancel the server job.",
+      );
+  }
+
   async function generate() {
     if (active.current) return;
     active.current = true;
@@ -90,25 +207,11 @@ export default function VideoPanel({ projectId, node, standalone }) {
         const result = await startVideoGeneration(projectId, node.id, voice);
         job_id = result.job_id;
       }
+      localStorage.setItem(JOB_KEY, JSON.stringify({ job_id, project: projectId, at: Date.now() }));
       setJob(job_id);
-      const deadline = Date.now() + 12 * 60 * 1000;
-      while (!cancel.current && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 3000));
-        if (cancel.current) return;
-        const s = await getVideoStatus(job_id);
-        setStage(s.stage);
-        setProgress(Math.max(0, Math.min(1, Number(s.progress) || 0)));
-        if (s.status === "done") {
-          setStatus("done");
-          return;
-        }
-        if (s.status === "error")
-          throw new Error(s.error || "Video generation failed");
-      }
-      if (!cancel.current)
-        throw new Error(
-          "This render is taking longer than 12 minutes. The job may still be finishing. Refreshing does not cancel the server job.",
-        );
+      setJobStartedAt(Date.now());
+      setResumeAvailable("");
+      await poll(job_id);
     } catch (e) {
       if (!cancel.current) {
         setStatus("error");
@@ -137,6 +240,21 @@ export default function VideoPanel({ projectId, node, standalone }) {
       </div>
       <div className="space-y-4 px-5 py-4">
         <div className="mf-studio-card"><Video size={22}/><h3>Your code, told clearly.</h3><p>Choose a voice, listen to a sample, then create a source-grounded walkthrough.</p><div className="mf-studio-stage"><span>Source script</span><span>Neural narration</span><span>Animated diagrams</span></div></div>
+
+        {resumeAvailable && status !== "running" && (
+          <div className="mf-video-resume" role="status">
+            <RefreshCw className="h-3.5 w-3.5" />
+            <div>
+              <p>An earlier render for this project is still on the server.</p>
+              <p className="mf-video-resume-actions">
+                <button onClick={() => resumeJob(resumeAvailable)}>Reconnect</button>
+                <button onClick={() => { localStorage.removeItem(JOB_KEY); setResumeAvailable(""); }}>
+                  Discard
+                </button>
+              </p>
+            </div>
+          </div>
+        )}
         <div className="flex gap-2">
           <button
             disabled={status === "running"}
@@ -194,39 +312,53 @@ export default function VideoPanel({ projectId, node, standalone }) {
         )}
         {mode === "walkthrough" && status !== "running" && (
           <>
-            <label className="block text-xs font-semibold text-umber-700">
+            <div className="text-xs font-semibold text-umber-700">
               Neural voice
-              <select
-                aria-label="Video voice"
-                value={voice}
-                onChange={(e) => {
-                  previewController.current?.abort();
-                  setVoice(e.target.value);
-                  setPreview("");
-                }}
-                className="mt-2 block w-full rounded-xl border border-umber-200 bg-white p-3 text-xs font-normal"
-              >
-                {VOICES.map(([id, label]) => (
-                  <option key={id} value={id}>
-                    {label}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <button
-              className="flex items-center gap-2 text-xs text-clay"
-              disabled={previewBusy}
-              onClick={previewVoice}
-            >
-              {previewBusy ? (
-                <Loader2 className="h-3 w-3 animate-spin" />
-              ) : (
-                <Volume2 className="h-3 w-3" />
-              )}
-              Preview voice
-            </button>
+              <div className="mf-voice-row">
+                <button type="button" className="mf-voice-step" aria-label="Previous voice" onClick={() => stepVoice(-1)}>
+                  <ChevronLeft className="h-3.5 w-3.5" />
+                </button>
+                <select
+                  aria-label="Video voice"
+                  value={voice}
+                  onChange={(e) => pickVoice(e.target.value)}
+                  className="mf-voice-select"
+                >
+                  {VOICES.map(([id, label]) => (
+                    <option key={id} value={id}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+                <button type="button" className="mf-voice-step" aria-label="Next voice" onClick={() => stepVoice(1)}>
+                  <ChevronRight className="h-3.5 w-3.5" />
+                </button>
+                <button
+                  type="button"
+                  className="mf-voice-sample"
+                  disabled={previewBusy}
+                  onClick={() => previewVoice()}
+                >
+                  {previewBusy && previewVoiceId === voice ? (
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                  ) : (
+                    <Volume2 className="h-3 w-3" />
+                  )}
+                  {previewBusy && previewVoiceId === voice ? "Preparing" : "Sample"}
+                </button>
+              </div>
+              <span className="mf-voice-hint">
+                Samples are fetched ahead for every voice, so “Sample” plays straight away.
+              </span>
+            </div>
             {preview && (
-              <NarrationPlayer src={preview} label="Voice preview" download="mindflow-voice-sample.wav" />
+              <NarrationPlayer
+                key={`${previewVoiceId}-${preview}`}
+                src={preview}
+                label={`Voice preview, ${VOICES.find(([id]) => id === previewVoiceId)?.[1] || voice}`}
+                download="mindflow-voice-sample.wav"
+                autoPlay
+              />
             )}
           </>
         )}
@@ -251,10 +383,28 @@ export default function VideoPanel({ projectId, node, standalone }) {
                 style={{ width: `${Math.round(progress * 100)}%` }}
               />
             </div>
+            <div className="mf-video-progress-meta">
+              <span>{Math.round(progress * 100)}%</span>
+              <span className="mf-video-elapsed">
+                <Clock className="h-3 w-3" />
+                {elapsed >= 1000 ? `${Math.floor(elapsed / 60000)}:${String(Math.floor((elapsed % 60000) / 1000)).padStart(2, "0")} elapsed` : "starting"}
+              </span>
+            </div>
+            <ol className="mf-video-steps">
+              {["Script from cited source", "Narration audio", "Diagrams", "Encode MP4"].map((label, i) => {
+                const at = Math.min(3, Math.floor((Number(progress) || 0) * 4));
+                return (
+                  <li key={label} className={i < at ? "done" : i === at ? "active" : ""}>
+                    {i < at ? <CheckCircle2 className="h-3 w-3" /> : i === at ? <Loader2 className="h-3 w-3 animate-spin" /> : <span className="dot" />}
+                    {label}
+                  </li>
+                );
+              })}
+            </ol>
             <p className="text-[11px] leading-relaxed text-umber-500">
-              {Math.round(progress * 100)}%. Shared CPU rendering can take
-              several minutes. Keep this panel open. The rest of the app remains
-              usable.
+              Rendering is a shared CPU job, so the percentage can pause. If you
+              reload, this panel offers to reconnect instead of losing the render.
+              The rest of the app stays usable.
             </p>
           </div>
         ) : (
