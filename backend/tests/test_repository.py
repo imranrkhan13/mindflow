@@ -409,3 +409,137 @@ def test_retrieval_reuses_windows_for_follow_up_questions(monkeypatch):
     monkeypatch.setattr(r, 'build_chunks', real)
     assert r._CHUNK_CACHE and list(r._CHUNK_CACHE.values())[-1][1]
     assert all('id' not in chunk for chunk in list(r._CHUNK_CACHE.values())[-1][1])
+
+
+PR_PATCH = """diff --git a/src/upload.py b/src/upload.py
+index 1111111..2222222 100644
+--- a/src/upload.py
++++ b/src/upload.py
+@@ -1,3 +1,6 @@
+ from app.store import save_message
+ 
++def upload_document(stream):
++    return save_message(stream)
++
+ def existing(): return 1
+diff --git a/src/gone.js b/src/gone.js
+--- a/src/gone.js
++++ /dev/null
+@@ -1,2 +0,0 @@
+-import x from './x'
+-export default x
+diff --git a/assets/logo.png b/assets/logo.png
+new file mode 100644
+Binary files /dev/null and b/assets/logo.png differ
+"""
+
+
+def test_pull_request_urls_are_strict():
+    assert r.parse_pr_url('https://github.com/owner/repo/pull/12') == ('owner', 'repo', 12)
+    assert r.parse_pr_url('https://github.com/owner/repo/pull/12.diff') == ('owner', 'repo', 12)
+    for bad in [
+        'https://github.com/owner/repo/pull/0',
+        'https://github.com/owner/repo/pulls/12',
+        'https://github.com/owner/repo/pull/12/files',
+        'https://github.com/owner/repo/issues/12',
+        'http://github.com/owner/repo/pull/12',
+        'https://evil.com/owner/repo/pull/12',
+        'https://github.com/../repo/pull/12',
+        'https://github.com/owner/repo/pull/12?x=1',
+    ]:
+        with pytest.raises(HTTPException):
+            r.parse_pr_url(bad)
+
+
+def test_diff_parsing_counts_and_kinds():
+    files = r.diff_files(PR_PATCH)
+    assert [f['path'] for f in files] == ['src/upload.py', 'src/gone.js', 'assets/logo.png']
+    added, deleted, binary = files
+    assert added['kind'] == 'modified' and added['added'] == 3 and added['removed'] == 0
+    assert deleted['kind'] == 'deleted'
+    assert binary.get('binary') is True
+
+
+def test_review_clusters_and_novel_symbols_without_fabrication():
+    data = r.index_archive(archive({'src/upload.py': 'from app.store import save_message\n\ndef existing(): return 1\n',
+                                    'src/gone.js': "import x from './x'\n",
+                                    'app/store.py': 'def save_message(m):\n    return m\n',
+                                    'src/other.py': 'from src.upload import upload_document\n'}), 'o', 'r', 'c' * 40)
+    clusters = r.review_clusters(r.diff_files(PR_PATCH))
+    snippets = r.review_retrieval(data, clusters)
+    assert all(s['path'] != 'src/upload.py' for s in snippets)
+    assert 'upload_document' in clusters[0]['symbols']
+    # upload_document is used by src/other.py, so it must NOT be flagged as novel.
+    assert 'upload_document' not in clusters[0]['novel']
+    checks = r.review_checks(clusters, snippets)
+    assert any(c['path'] == 'src/gone.js' and 'deleted' in c['text'] for c in checks)
+    assert any(c['path'] == 'assets/logo.png' and 'Binary' in c['text'] for c in checks)
+    entries = r.review_entries(clusters)
+    assert [e['id'] for e in entries] == ['D1', 'D2', 'D3']
+    assert entries[0]['added_code'].startswith('def upload_document')
+    # Only changed lines are sent to the model, never whole unchanged files.
+    assert all(line[:1] in {'+', '-', '@', ' ', '\\'} for line in entries[0]['added_code'].splitlines()[1:])
+    assert 'existing(): return 1' not in entries[0]['added_code']
+
+
+def test_pr_endpoint_with_github_mocked(monkeypatch):
+    data = sample(); r.save(data)
+    monkeypatch.setattr(r.settings, 'openrouter_api_key', None)
+
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def stream(self, *args, **kwargs):
+            outer = self
+            class Ctx:
+                async def __aenter__(self):
+                    class Response:
+                        status_code = 200
+                        async def aiter_text(self):
+                            yield PR_PATCH
+                    return Response()
+                async def __aexit__(self, *args): return False
+            return Ctx()
+    monkeypatch.setattr(r.httpx, 'AsyncClient', Client)
+    app = FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        response = client.post(f"/api/repository/{data['id']}/pull-request",
+                               json={'url': 'https://github.com/owner/repo/pull/7', 'question_key': 'review'})
+        assert response.status_code == 200
+        text = response.text
+        assert 'event: pr_files' in text
+        assert 'event: review_checks' in text
+        assert 'event: pr_summary' in text
+        assert 'No free model key is configured' in text
+        assert 'event: review\n' not in text
+
+
+def test_pr_endpoint_reports_bad_pr_without_model(monkeypatch):
+    data = sample(); r.save(data)
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *args): pass
+        def stream(self, *args, **kwargs):
+            class Ctx:
+                async def __aenter__(self):
+                    class Response: status_code = 404
+                    return Response()
+                async def __aexit__(self, *args): return False
+            return Ctx()
+    monkeypatch.setattr(r.httpx, 'AsyncClient', Client)
+    app = FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        body = client.post(f"/api/repository/{data['id']}/pull-request", json={'url': 'https://github.com/owner/repo/pull/99'}).text
+    assert 'not found' in body and 'Private repositories are not supported' in body
+
+
+def test_model_payload_cannot_override_model_and_cites_diff_entries():
+    data = sample()
+    snippets = r.retrieve(data, 'send chat')
+    p = r.model_payload('q', snippets)
+    assert p['model'] == 'openrouter/free'
+    assert p['stream'] is True
+    prompt = r.review_prompt('risk', r.review_clusters(r.diff_files(PR_PATCH)), 'o/r', 'd' * 40)
+    assert 'D1' in prompt and 'most likely to break' in prompt and 'o/r at commit dddddddd' in prompt

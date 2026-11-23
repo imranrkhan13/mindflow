@@ -16,6 +16,7 @@ import {
   Code2,
   FileCode2,
   GitBranch,
+  GitPullRequest,
   Github,
   Layers3,
   Loader2,
@@ -28,6 +29,7 @@ import {
 import LegacyApp from "./LegacyApp.jsx";
 import Landing from "./pages/Landing.jsx";
 import VideoPanel from "./components/VideoPanel.jsx";
+import ReviewPanel from "./components/ReviewPanel.jsx";
 import NarrationPlayer from "./components/NarrationPlayer.jsx";
 import { requestNarration, narrationText } from "./lib/narration.js";
 import {
@@ -524,6 +526,7 @@ const STUDIO_TABS = [
   ["explain", "Explain", BookOpen],
   ["architecture", "Architecture", Layers3],
   ["interview", "Interview", GraduationCap],
+  ["review", "PR review", GitPullRequest],
   ["video", "Video", Video],
 ];
 const STUDIO_CSS = `
@@ -1014,7 +1017,9 @@ function RepositoryApp() {
               ? status || "Searching code / streaming evidence"
               : nodes.length
                 ? `${nodes.filter(n => n.path).length} source files · answer evidence map`
-                : "Ready to explore"}
+                : tab === "review"
+                  ? "Pull requests are reviewed in the PR review tab"
+                  : "Ready to explore"}
             <button onClick={() => setFitKey((k) => k + 1)}>Fit map</button>
           </div>
           {nodes.length > 0 && (
@@ -1036,7 +1041,7 @@ function RepositoryApp() {
               </button>
             ))}
           </nav>
-          {tab !== "ask" && (
+          {tab !== "ask" && tab !== "review" && (
             <div className="mf-studio-tools">
               <h3>
                 {tab === "explain"
@@ -1090,7 +1095,14 @@ function RepositoryApp() {
               )}
             </div>
           )}
-          {tab === "video" ? (
+          {tab === "review" ? (
+            <div className="mf-media-body mf-review-scroll">
+              <ReviewPanel
+                project={project}
+                onSource={(path) => openSource(path)}
+              />
+            </div>
+          ) : tab === "video" ? (
             <div className="mf-media-body">
               <VideoPanel
                 key={selected}
