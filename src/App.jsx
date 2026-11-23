@@ -30,7 +30,6 @@ import Landing from "./pages/Landing.jsx";
 import VideoPanel from "./components/VideoPanel.jsx";
 import NarrationPlayer from "./components/NarrationPlayer.jsx";
 import { requestNarration, narrationText } from "./lib/narration.js";
-import { uploadDocument } from "./lib/api.js";
 import {
   BookOpen,
   MessageSquare,
@@ -178,6 +177,101 @@ function Answer({ text, sources, onSource }) {
     </div>
   );
 }
+function formatMs(ms) {
+  return ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`;
+}
+
+/* Prompts derived from the snapshot itself, so the first question is one click
+   away and already points at real paths in this repository. */
+function StarterPrompts({ project, selected, onPick, onAsk }) {
+  const prompts = useMemo(() => {
+    const files = project?.files || [];
+    const tests = files.filter((f) => /(^|\/)(tests?|__tests__|spec)\//i.test(f.path) || /\.(test|spec)\.[a-z]+$/i.test(f.path));
+    const entry = files.find((f) => /(^|\/)(main|app|index|server|cli|program)\.[a-z]+$/i.test(f.path));
+    const firstTest = tests[0];
+    return [
+      "Give me an overview of this repository and its entry points.",
+      entry ? `Walk me through ${entry.path}, starting at its top-level definitions.` : null,
+      firstTest ? `What does ${firstTest.path} check, and which source files does it import?` : null,
+      "Trace the main data flow across files.",
+      "Where are errors handled, and what tests cover them?",
+    ].filter(Boolean);
+  }, [project]);
+
+  return (
+    <div className="mf-starters">
+      <div className="mf-starters-head">
+        <span className="mf-eyebrow">TRY ONE</span>
+        <span>
+          {selected ? (
+            <>
+              context: <code>{selected.split("/").pop()}</code>
+            </>
+          ) : (
+            "tap to fill the box, then send"
+          )}
+        </span>
+      </div>
+      {prompts.map((q, i) => (
+        <div key={q} className="mf-starter">
+          <button className="label" onClick={() => onPick(q)} title="Put this in the question box">
+            {q}
+          </button>
+          <button className="go" onClick={() => onAsk(q)} aria-label={`Ask: ${q}`}>
+            <ArrowUpRight size={15} />
+          </button>
+          {i === 0 && <span className="mf-starter-tag">start here</span>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* Shows what is actually happening while the answer is still empty, so a slow
+   free model reads as progress instead of a frozen panel. */
+const STAGES = [
+  ["Reading the saved snapshot"],
+  ["Searching every indexed source file"],
+  ["Sending the closest excerpts to the free model", "Writing the answer from the cited code"],
+  ["Checking source IDs"],
+];
+
+function RetrievalStages({ status, sources }) {
+  const reached = !status
+    ? 0
+    : /Checking source IDs|Writing the answer/i.test(status)
+      ? 3
+      : /Sending the retrieved|asking the free model|Found \d+/i.test(status)
+        ? 2
+        : /Searching/i.test(status)
+          ? 1
+          : 0;
+  const labels = [
+    "Snapshot opened",
+    sources?.length != null
+      ? `${sources.length} matching excerpt${sources.length === 1 ? "" : "s"} found`
+      : "Searching every indexed file…",
+    sources?.length === 0 ? "No excerpt matched" : "Free model is composing the answer",
+    "Source IDs checked before display",
+  ];
+  return (
+    <ol className="mf-stages" aria-live="polite">
+      {labels.map((label, i) => (
+        <li key={STAGES[i][0]} className={i < reached ? "done" : i === reached ? "active" : ""}>
+          {i < reached ? (
+            <Check size={11} />
+          ) : i === reached ? (
+            <Loader2 size={11} className="mf-spin" />
+          ) : (
+            <span className="dot" />
+          )}
+          {label}
+        </li>
+      ))}
+    </ol>
+  );
+}
+
 function SourceNode({ data }) {
   return (
     <div className={`mf-node ${data.active ? "active" : ""}`}>
@@ -449,7 +543,16 @@ function RepositoryApp() {
   const [project, setProject] = useState(null),
     [url, setUrl] = useState(""),
     [error, setError] = useState(""),
-    [loading, setLoading] = useState(false);
+    [loading, setLoading] = useState(false),
+    [loadStartedAt, setLoadStartedAt] = useState(Date.now()),
+    [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    if (!loading) return;
+    setLoadStartedAt(Date.now());
+    setElapsed(0);
+    const id = setInterval(() => setElapsed(Date.now() - loadStartedAt), 1000);
+    return () => clearInterval(id);
+  }, [loading]);
   const [query, setQuery] = useState(""),
     [filter, setFilter] = useState(""),
     [messages, setMessages] = useState([]),
@@ -463,6 +566,7 @@ function RepositoryApp() {
     [coverage, setCoverage] = useState(false),
     [active, setActive] = useState(""),
     [provider, setProvider] = useState(null),
+    [probe, setProbe] = useState({ state: "checking" }),
     [fitKey, setFitKey] = useState(0);
   const [tab, setTab] = useState("ask"),
     [focus, setFocus] = useState("");
@@ -477,11 +581,23 @@ function RepositoryApp() {
     end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, status]);
   useEffect(() => {
+    // Time the free-model check: it is a network round-trip to the backend,
+    // which is the most common cause of a slow first answer.
+    const started = performance.now();
     api("/status")
-      .then(setProvider)
-      .catch(() =>
-        setProvider({ ready: false, reason: "Provider status unavailable" }),
-      );
+      .then((p) => {
+        setProvider(p);
+        const ms = performance.now() - started;
+        setProbe(
+          p.ready
+            ? { state: "ready", ms, model: p.model }
+            : { state: "limited", ms, reason: p.reason || "Free model not ready" },
+        );
+      })
+      .catch((e) => {
+        setProvider({ ready: false, reason: "Provider status unavailable" });
+        setProbe({ state: "error", reason: e.message });
+      });
     const m = window.location.pathname.match(/^\/repo\/([a-f0-9-]{36})$/);
     if (m) {
       setLoading(true);
@@ -545,13 +661,32 @@ function RepositoryApp() {
     setEdges([]);
     setSources([]);
     setGraphInfo("");
-    setStatus("Finding code evidence...");
+    setStatus("Searching every indexed source file…");
+    const startedAt = Date.now();
     const id = Date.now();
     setGraphId(id);
     const questionNode = { id: `question-${id}`, kind: "question", label: question };
     setNodes([questionNode]);
     let answerNodes = [questionNode];
     let answerEdges = [];
+    // Only the newest chat answer owns the shared right-side node list, so a
+    // slower older stream cannot overwrite it. Visible effect: answers and
+    // their source map land in one batch instead of a burst of re-renders.
+    let repaintQueued = false;
+    const repaint = () => {
+      if (repaintQueued) return;
+      repaintQueued = true;
+      queueMicrotask(() => {
+        repaintQueued = false;
+        const evidence = answerNodes
+          .filter((n) => n.path)
+          .map((n) => ({ id: `evidence-${n.id}`, source: questionNode.id, target: n.id, kind: "evidence" }));
+        const graph = { nodes: [...answerNodes], edges: [...answerEdges, ...evidence] };
+        setNodes(graph.nodes);
+        setEdges(graph.edges);
+        update({ graph });
+      });
+    };
     const previous = messages.filter(m => !m.failed && !m.provisional).slice(-4);
     const context = previous.map(m => `${m.role}: ${m.text.slice(0, 200)}`).join("\n");
     const contextBudget = Math.max(0, 1200 - question.length - 130);
@@ -601,7 +736,16 @@ function RepositoryApp() {
           if (type === "sources") {
             currentSources = data.sources;
             setSources(data.sources);
-            update({ sources: data.sources, searched: data.searched_files });
+            update({
+              sources: data.sources,
+              searched: data.searched_files,
+              retrieved: data.sources.length,
+            });
+            setStatus(
+              data.sources.length
+                ? `Found ${data.sources.length} matching source ${data.sources.length === 1 ? "excerpt" : "excerpts"} — asking the free model…`
+                : "No matching source found — checking…",
+            );
           }
           if (type === "node") {
             const existing = answerNodes.find(n => n.path && n.path === data.path);
@@ -618,19 +762,25 @@ function RepositoryApp() {
               }
               answerNodes = answerNodes.map(n => n.id === node.id ? { ...n, citations: [...new Set([...(n.citations || []), source.id])] } : n);
             }
-            const evidence = answerNodes.filter(n => n.path).map(n => ({ id: `evidence-${n.id}`, source: questionNode.id, target: n.id, kind: "evidence" }));
-            setNodes([...answerNodes]);
-            setEdges([...answerEdges, ...evidence]);
-            update({ graph: { nodes: [...answerNodes], edges: [...answerEdges, ...evidence] } });
+            repaint();
           }
           if (type === "graph_info") setGraphInfo(data.text);
-          if (type === "answer") update((m) => ({ text: m.text + data.text }));
+          if (type === "answer")
+            update((m) => ({
+              text: m.text + data.text,
+              // First visible token ends the wait; record how long it took.
+              ttftMs: m.ttftMs ?? Date.now() - startedAt,
+            }));
           if (type === "error" || type === "invalid") {
             update({ text: data.text, failed: true, provisional: false });
             completed = true;
           }
           if (type === "done") {
-            update({ provisional: false, provider: data.provider });
+            update({
+              provisional: false,
+              provider: data.provider,
+              totalMs: Date.now() - startedAt,
+            });
             setStatus("Answer ready — check the linked files");
             completed = true;
           }
@@ -651,6 +801,11 @@ function RepositoryApp() {
         provisional: false,
       });
     } finally {
+      if (controller.current?.signal.aborted) {
+        update((m) =>
+          m.provisional ? { provisional: false, stopped: true } : {},
+        );
+      }
       setBusy(false);
       setStatus("");
       setFitKey((k) => k + 1);
@@ -663,18 +818,6 @@ function RepositoryApp() {
     setMessages([]);
     setError("");
     window.history.replaceState({}, "", "/");
-  }
-  async function uploadFile(file) {
-    if (loading) return;
-    setLoading(true);
-    setError("");
-    try {
-      const result = await uploadDocument(file);
-      window.location.assign(`/share/${result.project_id}`);
-    } catch (e) {
-      setError(e.message);
-      setLoading(false);
-    }
   }
   const selected =
     focus ||
@@ -700,18 +843,17 @@ function RepositoryApp() {
   if (!project)
     return (
       <>
-        <Landing
-          onFileReady={uploadFile}
-          onGithubImport={importRepo}
-          error={error}
-        />
+        <Landing onGithubImport={importRepo} error={error} loading={loading} />
         {loading && (
           <div className="mf-loading-screen">
             <Loader2 className="mf-spin" />
-            <h2>Getting your code ready</h2>
+            <h2>Reading the repository</h2>
             <p>
-              We check for a saved copy first. A new, large repository can take a few minutes to download and read. Opening the same saved project is faster.
+              We check for a saved copy of this commit first. A new, large
+              repository can take a few minutes to download and index — the
+              counter below is elapsed time, not a progress bar.
             </p>
+            <p className="mf-loading-time">{formatMs(elapsed)} elapsed</p>
           </div>
         )}
         <style>{STUDIO_CSS}</style>
@@ -820,14 +962,47 @@ function RepositoryApp() {
               <div className="mf-empty-symbol">
                 <GitBranch size={42} />
               </div>
-              <h3>Start with a question.</h3>
-              <p>
-                Relevant source files appear here.
-                <br />
-                Connections are drawn only when an import
-                <br />
-                can be traced to a real line of code.
-              </p>
+              {selected ? (
+                <>
+                  <h3>Here is the file you picked.</h3>
+                  <div className="mf-canvas-pick">
+                    <FileCode2 size={15} />
+                    <code>{selected}</code>
+                  </div>
+                  <div className="mf-canvas-actions">
+                    <button className="primary" onClick={() => setTab("ask")}>
+                      <MessageSquare size={14} /> Ask about this file
+                    </button>
+                    <button
+                      disabled={busy || !["explain", "architecture", "interview"].includes(tab)}
+                      onClick={() => task(tab)}
+                    >
+                      {busy ? <Loader2 size={14} className="mf-spin" /> : <BookOpen size={14} />}
+                      {tab === "interview"
+                        ? "Interview prep"
+                        : tab === "architecture"
+                          ? "Trace architecture"
+                          : "Explain it"}
+                    </button>
+                  </div>
+                  <p>
+                    Pick a prompt below and the source map fills with the files
+                    the answer used. Connections are drawn only when an import
+                    can be traced to a real line of code.
+                  </p>
+                </>
+              ) : (
+                <>
+                  <h3>Start with a question.</h3>
+                  <p>
+                    Relevant source files appear here.
+                    <br />
+                    Connections are drawn only when an import
+                    <br />
+                    can be traced to a real line of code.
+                  </p>
+                </>
+              )}
               <span>
                 {(project.edge_count ?? project.edges?.length ?? 0)} import connections found in this snapshot
               </span>
@@ -836,7 +1011,7 @@ function RepositoryApp() {
           <div className="mf-canvas-note">
             <span className={busy ? "mf-live-dot" : "mf-muted-dot"} />
             {busy
-              ? "Searching code / streaming evidence"
+              ? status || "Searching code / streaming evidence"
               : nodes.length
                 ? `${nodes.filter(n => n.path).length} source files · answer evidence map`
                 : "Ready to explore"}
@@ -928,7 +1103,27 @@ function RepositoryApp() {
             <>
               <div className="mf-chat-heading">
                 <span className="mf-eyebrow">ASK THE REPOSITORY</span>
-                <span className="mf-provider">FREE ROUTE</span>
+                <span
+                  className={`mf-provider ${probe.state}`}
+                  title={
+                    probe.state === "ready"
+                      ? `${probe.model} · free model check took ${Math.round(probe.ms)} ms`
+                      : probe.reason || "Checking the free model route"
+                  }
+                >
+                  {probe.state === "checking" ? (
+                    <>
+                      <Loader2 size={9} className="mf-spin" /> CHECKING ROUTE
+                    </>
+                  ) : probe.state === "ready" ? (
+                    <>
+                      <span className="mf-provider-dot" /> FREE ROUTE ·{" "}
+                      {Math.round(probe.ms)} ms
+                    </>
+                  ) : (
+                    "SOURCE SEARCH ONLY"
+                  )}
+                </span>
               </div>
               <div className="mf-messages">
                 {!shown.length ? (
@@ -953,17 +1148,14 @@ function RepositoryApp() {
                         ? "Ask about a route, a component or a function. We search the saved code and read the parts that best match your question."
                         : "Choose a file and a tool above. Explanations, analogies, architecture and interview prep keep source references attached."}
                     </p>
-                    {tab === "ask" &&
-                      [
-                        "Give me an overview of this repository and its entry points.",
-                        "Trace the main data flow across files.",
-                        "Where are errors handled, and what tests cover them?",
-                      ].map((q) => (
-                        <button key={q} onClick={() => ask(q)}>
-                          {q}
-                          <ArrowUpRight size={15} />
-                        </button>
-                      ))}
+                    {tab === "ask" && (
+                      <StarterPrompts
+                        project={project}
+                        selected={selected}
+                        onPick={(prompt) => setQuery(prompt)}
+                        onAsk={ask}
+                      />
+                    )}
                     <div className="mf-chat-disclaimer">
                       We search the saved files, then use the closest matches to answer. Open “Files included” to see what was left out.
                     </div>
@@ -981,9 +1173,15 @@ function RepositoryApp() {
                             ? "SOURCE SEARCH / LIMIT"
                             : "MINDFLOW"}
                         {m.role === "assistant" && m.provisional && (
-                          <span>draft · streaming</span>
+                          <span>{m.text ? "draft · streaming" : "searching source"}</span>
+                        )}
+                        {m.role === "assistant" && !m.provisional && m.stopped && (
+                          <span>stopped</span>
                         )}
                       </div>
+                      {m.role === "assistant" && !m.text && !m.failed && (
+                        <RetrievalStages status={status} sources={m.sources} />
+                      )}
                       {m.role === "assistant" && m.graph && <button disabled={busy} className={`mf-view-map ${graphId === m.id ? "active" : ""}`} onClick={() => { setNodes(m.graph.nodes); setEdges(m.graph.edges); setGraphId(m.id); setFitKey(k => k + 1); }}><GitBranch size={14} />{graphId === m.id ? "Viewing answer map" : "View answer map"}</button>}
                       <Answer
                         text={
@@ -999,6 +1197,14 @@ function RepositoryApp() {
                           <div className="mf-message-foot">
                             <ShieldCheck size={12} />
                             {m.searched} files searched · source IDs checked
+                            {m.ttftMs != null && (
+                              <span className="mf-timing">
+                                first words {formatMs(m.ttftMs)}
+                                {m.totalMs != null && m.totalMs > m.ttftMs
+                                  ? ` · complete ${formatMs(m.totalMs)}`
+                                  : ""}
+                              </span>
+                            )}
                           </div>
                         )}
                       {m.role === "assistant" &&
@@ -1036,6 +1242,21 @@ function RepositoryApp() {
                       }
                     }}
                   />
+                  {!query.trim() && !busy && selected && (
+                    <button
+                      className="mf-composer-ctx"
+                      type="button"
+                      onClick={() =>
+                        setQuery(
+                          `Explain what ${selected} is responsible for, and how the files it imports support that.`,
+                        )
+                      }
+                      title={`Use ${selected} as the question context`}
+                    >
+                      <FileCode2 size={13} />
+                      {selected.split("/").pop()}
+                    </button>
+                  )}
                   <button
                     aria-label={busy ? "Stop answer" : "Send question"}
                     type={busy ? "button" : "submit"}

@@ -1,7 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
-  Upload,
   ArrowRight,
   BookOpen,
   GraduationCap,
@@ -11,9 +10,14 @@ import {
   Link,
   ExternalLink,
   Clock,
+  Loader2,
+  Check,
+  X,
+  ChevronDown,
 } from "lucide-react";
 import AmbientGraph from "../components/AmbientGraph.jsx";
 import { getRecentProjects } from "../lib/api.js";
+import { validateRepoUrl, repoSlug } from "../lib/repoUrl.js";
 
 const FEATURES = [
   {
@@ -39,19 +43,112 @@ const FEATURES = [
 ];
 
 const EXAMPLE_REPOS = [
-  { label: "FastAPI", url: "https://github.com/tiangolo/fastapi" },
+  { label: "Flask", url: "https://github.com/pallets/flask" },
+  { label: "Vite", url: "https://github.com/vitejs/vite" },
   { label: "React", url: "https://github.com/facebook/react" },
   { label: "Next.js", url: "https://github.com/vercel/next.js" },
   { label: "Tailwind CSS", url: "https://github.com/tailwindlabs/tailwindcss" },
 ];
 
-export default function Landing({ onFileReady, onGithubImport, error }) {
-  const inputRef = useRef(null);
-  const [dragging, setDragging] = useState(false);
-  const [tab, setTab] = useState("github"); // 'file' | 'github'
+/* What the importer actually does once a repository is accepted. Shown before
+   the first question so the reader knows what the soon-to-be-asked answer is
+   built from. */
+const REPO_CHECKLIST = [
+  ["Read", "Every supported UTF-8 source, test, config and docs file at one pinned commit."],
+  ["Trace", "Python and JS/TS imports, line by line, so answers can show real connections."],
+  ["Skip", "Dependencies, build output, lockfiles, binaries and credential files — listed readably."],
+  ["Answer", "Only the closest excerpts go to the free model, and every claim carries a source ID."],
+];
+
+const PREVIEW_LINES = [
+  { kind: "q", text: "How does importing a GitHub repository work?" },
+  { kind: "close", text: "I look for the function that actually handles the import." },
+  { kind: "code", text: "async function importRepo(value) { … }", cite: "S1" },
+  { kind: "code", text: "fetch('/api/repository/import', { url })", cite: "S2" },
+  { kind: "note", text: "Two files · import traced at lines 1 and 2" },
+];
+
+/* ── Typewriter used by the preview (self-contained, no backend call) ─────── */
+function useTypedPreview(active) {
+  const [line, setLine] = useState(0);
+  const [chars, setChars] = useState(0);
+
+  useEffect(() => {
+    if (!active) return;
+    setLine(0);
+    setChars(0);
+  }, [active]);
+
+  useEffect(() => {
+    if (!active || line >= PREVIEW_LINES.length) return;
+    const text = PREVIEW_LINES[line].text;
+    if (chars < text.length) {
+      const id = setTimeout(() => setChars((c) => c + 2), 16);
+      return () => clearTimeout(id);
+    }
+    const id = setTimeout(() => {
+      setLine((l) => l + 1);
+      setChars(0);
+    }, 420);
+    return () => clearTimeout(id);
+  }, [active, line, chars]);
+
+  return { line, chars };
+}
+
+function AnswerPreview({ active }) {
+  const { line, chars } = useTypedPreview(active);
+  return (
+    <div className="mt-3 rounded-xl border border-umber-200 bg-white/70 p-3 font-mono text-[11px] leading-relaxed">
+      <p className="mb-2 font-mono text-[9px] uppercase tracking-wider text-umber-400">
+        Example answer · no repository needed
+      </p>
+      {PREVIEW_LINES.map((row, i) => {
+        if (i > line) return null;
+        const typed = i === line ? row.text.slice(0, chars) : row.text;
+        const done = i < line || chars >= row.text.length;
+        return (
+          <div
+            key={row.text}
+            className={`flex gap-2 rounded px-1.5 py-1 ${
+              row.kind === "q"
+                ? "bg-umber-100/70 text-umber-900"
+                : "text-umber-600"
+            }`}
+          >
+            <span className="w-3 shrink-0 text-umber-300">
+              {row.kind === "q" ? "›" : row.kind === "note" ? "·" : "↳"}
+            </span>
+            <span className="min-w-0 break-words">
+              {typed}
+              {!done && <span className="ml-0.5 inline-block h-3 w-1 animate-pulse bg-clay align-middle" />}
+            </span>
+            {row.cite && done && (
+              <span className="ml-auto shrink-0 rounded border border-clay/30 bg-clay/10 px-1 text-[9px] text-clay">
+                {row.cite}
+              </span>
+            )}
+          </div>
+        );
+      })}
+      {line >= PREVIEW_LINES.length ? (
+        <p className="mt-2 flex items-center gap-1.5 text-[10px] text-sage">
+          <Check className="h-3 w-3" /> Citations checked against the pinned commit
+        </p>
+      ) : (
+        <p className="mt-2 flex items-center gap-1.5 text-[10px] text-umber-400">
+          <Loader2 className="h-3 w-3 animate-spin" /> streaming from source evidence
+        </p>
+      )}
+    </div>
+  );
+}
+
+export default function Landing({ onGithubImport, error, loading = false }) {
   const [githubUrl, setGithubUrl] = useState("");
   const [githubError, setGithubError] = useState("");
   const [recent, setRecent] = useState([]);
+  const [showChecklist, setShowChecklist] = useState(false);
 
   useEffect(() => {
     getRecentProjects()
@@ -59,23 +156,20 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
       .catch(() => {});
   }, []);
 
-  function handleFiles(files) {
-    const file = files?.[0];
-    if (file) onFileReady(file);
-  }
+  const slug = useMemo(() => repoSlug(githubUrl), [githubUrl]);
+  const validation = githubUrl ? validateRepoUrl(githubUrl) : "";
+  const ready = Boolean(slug) && !validation;
 
-  function handleGithubSubmit() {
-    const url = githubUrl.trim();
-    if (!url) {
-      setGithubError("Paste a GitHub repo URL");
-      return;
-    }
-    if (!url.startsWith("https://github.com/")) {
-      setGithubError("Must start with https://github.com/");
+  function handleGithubSubmit(e) {
+    e?.preventDefault?.();
+    if (loading) return;
+    const problem = validateRepoUrl(githubUrl);
+    if (problem) {
+      setGithubError(problem);
       return;
     }
     setGithubError("");
-    onGithubImport(url);
+    onGithubImport(githubUrl.trim());
   }
 
   return (
@@ -89,8 +183,8 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           animate={{ opacity: 1, y: 0 }}
           className="mb-6 flex items-center gap-2 rounded-full border border-umber-200 bg-white/80 px-4 py-1.5 font-sans text-xs font-medium text-umber-600 shadow-card backdrop-blur"
         >
-          🧠 Upload docs or import a GitHub repo — explore source, explanations
-          and videos
+          🧠 Import a public GitHub repo — explore source, explanations and
+          videos
         </motion.div>
 
         {/* Hero */}
@@ -110,7 +204,7 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           transition={{ delay: 0.1 }}
           className="mt-4 max-w-lg text-center font-sans text-base text-umber-600"
         >
-          Paste a GitHub URL or drop a markdown file. MindFlow maps it into an
+          Paste a public GitHub URL. MindFlow maps the whole repository into an
           interactive source map with code-cited answers, explanations,
           interview prep, and narrated videos.
         </motion.p>
@@ -122,132 +216,156 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           transition={{ delay: 0.14 }}
           className="mt-8 w-full max-w-lg"
         >
-          {/* Tab toggle */}
-          <div className="mb-3 flex rounded-xl border border-umber-200 bg-white/80 p-1 shadow-card">
-            {[
-              { id: "github", icon: Github, label: "GitHub URL" },
-              { id: "file", icon: Upload, label: "Upload file" },
-            ].map((t) => (
-              <button
-                key={t.id}
-                onClick={() => setTab(t.id)}
-                className={`flex flex-1 items-center justify-center gap-2 rounded-lg py-2 font-sans text-sm font-medium transition-all ${
-                  tab === t.id
-                    ? "bg-umber-900 text-white shadow"
-                    : "text-umber-500 hover:text-umber-800"
+          <form
+            onSubmit={handleGithubSubmit}
+            className="rounded-2xl border border-umber-200 bg-white/80 p-5 shadow-card backdrop-blur"
+          >
+            <label
+              htmlFor="repo-url"
+              className="mb-2 block font-mono text-[10px] uppercase tracking-wider text-umber-400"
+            >
+              Public repository URL
+            </label>
+            <div className="flex gap-2">
+              <div
+                className={`flex flex-1 items-center gap-2 rounded-xl border bg-white px-3 py-2.5 transition-colors ${
+                  githubError
+                    ? "border-clay/60"
+                    : ready
+                      ? "border-sage/60"
+                      : "border-umber-200"
                 }`}
               >
-                <t.icon className="h-4 w-4" />
-                {t.label}
-              </button>
-            ))}
-          </div>
-
-          <AnimatePresence mode="wait">
-            {/* GitHub tab */}
-            {tab === "github" && (
-              <motion.div
-                key="github"
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-                className="rounded-2xl border border-umber-200 bg-white/80 p-5 shadow-card backdrop-blur"
+                <Github className="h-4 w-4 shrink-0 text-umber-400" />
+                <input
+                  id="repo-url"
+                  value={githubUrl}
+                  onChange={(e) => {
+                    setGithubUrl(e.target.value);
+                    if (githubError) setGithubError("");
+                  }}
+                  placeholder="https://github.com/owner/repo"
+                  aria-invalid={Boolean(githubError)}
+                  aria-describedby="repo-url-help"
+                  spellCheck={false}
+                  autoComplete="off"
+                  disabled={loading}
+                  className="w-full bg-transparent font-mono text-sm text-umber-900 placeholder:text-umber-400 focus:outline-none disabled:opacity-60"
+                />
+                {ready && <Check className="h-4 w-4 shrink-0 text-sage" />}
+              </div>
+              <button
+                type="submit"
+                disabled={loading || !ready}
+                className="flex items-center gap-2 rounded-xl bg-umber-900 px-4 py-2.5 font-sans text-sm font-semibold text-white transition-colors hover:bg-umber-800 disabled:opacity-40"
               >
-                <div className="flex gap-2">
-                  <div className="flex flex-1 items-center gap-2 rounded-xl border border-umber-200 bg-white px-3 py-2.5">
-                    <Github className="h-4 w-4 shrink-0 text-umber-400" />
-                    <input
-                      value={githubUrl}
-                      onChange={(e) => setGithubUrl(e.target.value)}
-                      onKeyDown={(e) =>
-                        e.key === "Enter" && handleGithubSubmit()
-                      }
-                      placeholder="https://github.com/owner/repo"
-                      className="w-full bg-transparent font-mono text-sm text-umber-900 placeholder:text-umber-400 focus:outline-none"
-                    />
-                  </div>
-                  <button
-                    onClick={handleGithubSubmit}
-                    className="rounded-xl bg-umber-900 px-4 py-2.5 font-sans text-sm font-semibold text-white hover:bg-umber-800 transition-colors"
-                  >
-                    Import
-                  </button>
-                </div>
-
-                {githubError && (
-                  <p className="mt-2 font-sans text-xs text-clay">
-                    {githubError}
-                  </p>
+                {loading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Reading
+                  </>
+                ) : (
+                  "Import"
                 )}
+              </button>
+            </div>
 
-                {/* Example repos */}
-                <div className="mt-3">
-                  <p className="mb-1.5 font-mono text-[10px] uppercase tracking-wider text-umber-400">
-                    Try a popular repo
-                  </p>
-                  <div className="flex flex-wrap gap-2">
-                    {EXAMPLE_REPOS.map((r) => (
-                      <button
-                        key={r.label}
-                        onClick={() => {
-                          setGithubUrl(r.url);
-                        }}
-                        className="rounded-full border border-umber-200 bg-umber-100/50 px-3 py-1 font-sans text-xs text-umber-700 hover:border-clay hover:text-clay transition-colors"
-                      >
-                        {r.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </motion.div>
-            )}
+            <p
+              id="repo-url-help"
+              className={`mt-2 flex min-h-[16px] items-start gap-1.5 font-sans text-xs ${
+                githubError || validation ? "text-clay" : "text-umber-500"
+              }`}
+            >
+              {githubError || validation ? (
+                <>
+                  <X className="mt-0.5 h-3 w-3 shrink-0" />
+                  {githubError || validation}
+                </>
+              ) : slug ? (
+                <>
+                  <Check className="mt-0.5 h-3 w-3 shrink-0 text-sage" />
+                  <span className="text-umber-600">
+                    Ready to read <span className="font-mono">{slug}</span> at its
+                    default branch's latest commit
+                  </span>
+                </>
+              ) : (
+                "Public repos only · repository root link · no uploads"
+              )}
+            </p>
 
-            {/* File upload tab */}
-            {tab === "file" && (
-              <motion.div
-                key="file"
-                initial={{ opacity: 0, y: 4 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -4 }}
-              >
-                <div
-                  onDragOver={(e) => {
-                    e.preventDefault();
-                    setDragging(true);
-                  }}
-                  onDragLeave={() => setDragging(false)}
-                  onDrop={(e) => {
-                    e.preventDefault();
-                    setDragging(false);
-                    handleFiles(e.dataTransfer.files);
-                  }}
-                  onClick={() => inputRef.current?.click()}
-                  className={`group cursor-pointer rounded-2xl border-2 border-dashed px-8 py-10 text-center transition-all ${
-                    dragging
-                      ? "border-clay bg-clay/5 scale-[1.01]"
-                      : "border-umber-200 bg-white/70 hover:border-clay/50 hover:bg-white/90 hover:shadow-card"
-                  } backdrop-blur`}
+            {/* Example repos */}
+            <div className="mt-3">
+              <p className="mb-1.5 font-mono text-[10px] uppercase tracking-wider text-umber-400">
+                Try a popular repo
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {EXAMPLE_REPOS.map((r) => {
+                  const selected = r.url === githubUrl.trim();
+                  return (
+                    <button
+                      key={r.label}
+                      type="button"
+                      disabled={loading}
+                      aria-pressed={selected}
+                      onClick={() => {
+                        setGithubUrl(r.url);
+                        setGithubError("");
+                      }}
+                      className={`rounded-full border px-3 py-1 font-sans text-xs transition-colors ${
+                        selected
+                          ? "border-clay bg-clay/10 text-clay"
+                          : "border-umber-200 bg-umber-100/50 text-umber-700 hover:border-clay hover:text-clay"
+                      }`}
+                    >
+                      {r.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Expandable: what happens before you ask a question */}
+            <button
+              type="button"
+              onClick={() => setShowChecklist((v) => !v)}
+              aria-expanded={showChecklist}
+              className="mt-4 flex w-full items-center justify-between rounded-xl border border-umber-200 bg-umber-100/40 px-3 py-2 text-left font-sans text-xs font-medium text-umber-700 hover:border-clay/40 hover:text-umber-900"
+            >
+              <span>What MindFlow reads before you ask anything</span>
+              <ChevronDown
+                className={`h-3.5 w-3.5 transition-transform ${showChecklist ? "rotate-180" : ""}`}
+              />
+            </button>
+
+            <AnimatePresence initial={false}>
+              {showChecklist && (
+                <motion.ul
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: "auto", opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="overflow-hidden"
                 >
-                  <input
-                    ref={inputRef}
-                    type="file"
-                    accept=".md,.markdown,.txt"
-                    className="hidden"
-                    onChange={(e) => handleFiles(e.target.files)}
-                  />
-                  <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-umber-100 group-hover:bg-clay/10 transition-colors">
-                    <Upload className="h-5 w-5 text-umber-400 group-hover:text-clay transition-colors" />
-                  </div>
-                  <p className="font-sans text-sm font-semibold text-umber-900">
-                    Drop your README or docs file here
-                  </p>
-                  <p className="mt-1 font-sans text-xs text-umber-500">
-                    or click to browse — .md .markdown .txt
-                  </p>
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
+                  {REPO_CHECKLIST.map(([verb, detail], i) => (
+                    <motion.li
+                      key={verb}
+                      initial={{ opacity: 0, x: -6 }}
+                      animate={{ opacity: 1, x: 0 }}
+                      transition={{ delay: i * 0.05 }}
+                      className="mt-1.5 flex gap-2.5 rounded-lg border border-umber-200 bg-white/80 px-3 py-2"
+                    >
+                      <span className="mt-0.5 flex h-5 shrink-0 items-center rounded bg-clay/10 px-1.5 font-mono text-[9px] uppercase text-clay">
+                        {verb}
+                      </span>
+                      <span className="font-sans text-[11px] leading-relaxed text-umber-600">
+                        {detail}
+                      </span>
+                    </motion.li>
+                  ))}
+                </motion.ul>
+              )}
+            </AnimatePresence>
+          </form>
 
           {error && (
             <div className="mt-3 rounded-xl border border-clay/25 bg-clay/5 px-4 py-2.5 font-sans text-xs text-clay-dim">
@@ -261,11 +379,21 @@ export default function Landing({ onFileReady, onGithubImport, error }) {
           </p>
         </motion.div>
 
+        {/* Live preview of the answer shape */}
+        <motion.div
+          initial={{ opacity: 0, y: 14 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: 0.2 }}
+          className="w-full max-w-lg"
+        >
+          <AnswerPreview active={!loading} />
+        </motion.div>
+
         <p className="mt-5 max-w-lg text-center text-[11px] leading-relaxed text-umber-500">
           Repository imports index all supported source at a pinned commit.
-          Uploads use the supplied document only. Answers can make mistakes.
-          Snapshots expire after 7 days or a backend rebuild. Choose narrated
-          source diagrams or experimental AI visual clips in the Video tab.
+          Answers can make mistakes. Snapshots expire after 7 days or a backend
+          rebuild. Choose narrated source diagrams or experimental AI visual
+          clips in the Video tab.
         </p>
         {/* Recent public projects */}
         {recent.length > 0 && (

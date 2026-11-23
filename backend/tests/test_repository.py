@@ -1,5 +1,6 @@
 import io
 import os
+import re
 import zipfile
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -351,3 +352,60 @@ def test_expired_commits_are_not_reused():
     with r.connection() as con:
         con.execute('UPDATE code_snapshots SET created=? WHERE id=?', (time.time()-86400*8, data['id']))
     assert r.cached_summary(data['repository'], data['sha']) is None
+
+
+def test_chunk_windows_are_memoised_per_snapshot_files():
+    d = sample()
+    r._CHUNK_CACHE.clear()
+    first = r.build_chunks(d['files'])
+    second = r.build_chunks(d['files'])
+    assert first is second
+    # A different snapshot object with identical content must not share windows.
+    other = sample()
+    assert r.build_chunks(other['files']) is not first
+    assert r.build_chunks(d['files']) is first
+
+
+def _split_stream(parts):
+    """Mirror of the /ask delta splitter: whole tokens only, IDs never cut."""
+    answer = ''; pending = ''
+    for text in parts:
+        pending += text
+        cut = max(pending.rfind(' '), pending.rfind('\n'), pending.rfind('\t'))
+        if cut >= 0:
+            ready, pending = pending[:cut + 1], pending[cut + 1:]
+        elif len(pending) < 200:
+            ready = ''
+        else:
+            ready, pending = pending, ''
+        hold = re.search(r'\[?S(?:\d+|$)(?::?\d*-?\d*)?$', ready)
+        if hold:
+            ready, pending = ready[:hold.start()], ready[hold.start():] + pending
+        answer += ready
+    return answer + pending
+
+
+def test_source_id_split_across_deltas_is_never_cut():
+    parts = ['The ', 'handler ', 'is ', 'in [S', '1] ', 'and ', 'also [', 'S2:1', '0-1', '2] end']
+    answer = _split_stream(parts)
+    assert '[S1]' in answer and '[S2:10-12]' in answer
+    assert _split_stream(['no space before', ' [S', '3] now']) == 'no space before [S3] now'
+
+
+def test_retrieval_reuses_windows_for_follow_up_questions(monkeypatch):
+    data = sample()
+    r._CHUNK_CACHE.clear()
+    calls = []
+    real = r.build_chunks
+
+    def counting(files):
+        calls.append(1)
+        return real(files)
+
+    monkeypatch.setattr(r, 'build_chunks', counting)
+    r.retrieve(data, 'send chat')
+    r.retrieve(data, 'save message')
+    assert len(calls) == 2
+    monkeypatch.setattr(r, 'build_chunks', real)
+    assert r._CHUNK_CACHE and list(r._CHUNK_CACHE.values())[-1][1]
+    assert all('id' not in chunk for chunk in list(r._CHUNK_CACHE.values())[-1][1])

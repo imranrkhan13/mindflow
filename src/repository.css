@@ -8,3 +8,38 @@
 
 /* Shared warm surfaces across repository, document and media workspaces. */
 .mf-app{--ink:#3d2b1f;--muted:#8b7766;--line:#e8e1d4;--paper:#fdfcfa;--accent:#8b5034}.mf-header,.mf-chat,.mf-files,.mf-studio-tabs{background:#fdfcfa}.mf-canvas,.mf-canvas .react-flow,.mf-canvas .react-flow__background{background:#faf8f4}.mf-file-list button.selected,.mf-file-list button:hover{background:#ede2d2;color:#5e4534}.mf-map-badge,.mf-provider,.mf-coverage-btn{background:#f3ece2!important;border-color:#ddc9a3!important;color:#7a5c46!important}.mf-composer textarea,.mf-file-search input{color:#4d3829}.mf-node,.mf-source-sheet,.mf-coverage-sheet{background:#fdfcfa}.mf-node.active{border-color:#8b5034;box-shadow:0 0 0 3px #8b50341a}.mf-citation{background:#f3e8db;color:#8b5034}.mf-live-dot,.mf-muted-dot,.mf-node-dot{background:#a87a52;box-shadow:none}.mf-speech,.mf-answer,.mf-chat-welcome p{color:#5e4534}.mf-chat-welcome h2{color:#3d2b1f}.mf-code{background:#faf8f4}.mf-code code{color:#5e4534}.mf-code .highlight{background:#ede2cd;border-color:#a87a52}.react-flow__handle{background:#a87a52!important}.mf-message.assistant{background:#fdfcfa}
+
+/* ── Interactive onboarding + honest progress states ─────────────────────── */
+.mf-starters{margin:-6px 0 4px}
+.mf-starters-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px;color:#a3978e;font-size:9px}
+.mf-starters-head code{font:9px ui-monospace,monospace;background:#f3ece2;border:1px solid #e4d8c9;border-radius:3px;padding:1px 4px;color:#8b5034}
+.mf-starter{position:relative;display:flex;align-items:stretch;gap:0;background:#f8f4f1;border:1px solid #e7e0da;border-radius:8px;margin-bottom:8px;overflow:hidden;transition:border-color .15s,background .15s,transform .15s}
+.mf-starter:hover{background:#f2ece7;border-color:#d0c1b5;transform:translateX(2px)}
+.mf-starter .label{flex:1;border:0;background:none;text-align:left;padding:11px 4px 11px 12px;font-size:11px;line-height:1.7;color:#7e7064}
+.mf-starter .go{border:0;border-left:1px solid #e7e0da;background:none;width:38px;display:grid;place-items:center;color:#b08a68;flex:none}
+.mf-starter .go:hover{background:#eadfd3;color:#8b5034}
+.mf-starter-tag{position:absolute;top:-1px;right:38px;background:#8b5034;color:#fff;font:7px ui-monospace,monospace;letter-spacing:.6px;text-transform:uppercase;padding:2px 5px;border-radius:0 0 0 4px;pointer-events:none}
+
+.mf-stages{list-style:none;margin:0 0 4px;padding:10px 12px;border:1px solid #ece4da;border-radius:8px;background:#fbf8f3;display:flex;flex-direction:column;gap:7px}
+.mf-stages li{display:flex;align-items:center;gap:8px;font-size:10px;color:#b3a89f;transition:color .2s}
+.mf-stages li.active{color:#8b5034}
+.mf-stages li.done{color:#7d8b6a}
+.mf-stages li .dot{width:5px;height:5px;border-radius:50%;background:#ded3c8;margin:0 3px}
+.mf-timing{margin-left:auto;font-family:ui-monospace,monospace;font-size:8px;color:#b4a89e}
+
+.mf-provider{display:inline-flex;align-items:center;gap:4px}
+.mf-provider.ready{color:#6f7f5c!important;border-color:#d8e0c9!important}
+.mf-provider.limited,.mf-provider.error{color:#a08055!important}
+.mf-provider-dot{width:5px;height:5px;border-radius:50%;background:#7d8b6a;box-shadow:0 0 0 3px #7d8b6a1a}
+
+.mf-canvas-pick{display:flex;align-items:center;gap:7px;max-width:min(420px,80%);margin:2px auto 16px;padding:7px 11px;border:1px solid #e4d8c9;border-radius:6px;background:#fbf8f3;color:#8b5034}
+.mf-canvas-pick code{font:10px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mf-canvas-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;margin-bottom:16px}
+.mf-canvas-actions button{display:inline-flex;align-items:center;gap:6px;border:1px solid #ddc9a3;background:#fff;border-radius:6px;padding:8px 12px;font-size:11px;color:#6d5442}
+.mf-canvas-actions button.primary{background:#8b5034;border-color:#8b5034;color:#fff}
+.mf-canvas-actions button:hover:not(:disabled){filter:brightness(.97)}
+
+.mf-composer-ctx{display:inline-flex;align-items:center;gap:5px;flex:none;align-self:center;max-width:45%;border:1px solid #e4d8c9;background:#fbf8f3;color:#8b5034;border-radius:5px;padding:4px 7px;font:9px ui-monospace,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mf-composer-ctx:hover{background:#f3ece2}
+@media(max-width:650px){.mf-starter .label{font-size:10px}.mf-composer-ctx{display:none}.mf-canvas-pick code{font-size:9px}}
+.mf-loading-time{font:10px ui-monospace,monospace;color:#a3978e;margin-top:-6px}

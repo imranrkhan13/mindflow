@@ -152,7 +152,16 @@ def tokens(text):
     return result
 
 
+# Retrieval windows are a pure function of a file's text. Cached snapshot rows are
+# immutable (save() inserts once per id and load() returns a fresh copy), so the
+# windows are memoised by object identity and never leak into stored snapshots or
+# API responses.
+_CHUNK_CACHE={}
+
+
 def build_chunks(files):
+    cached=_CHUNK_CACHE.get(id(files))
+    if cached is not None and cached[0] is files: return cached[1]
     chunks=[]
     for f in files:
         lines=f['text'].splitlines(); start=0
@@ -165,6 +174,11 @@ def build_chunks(files):
             chunks.append({'path':f['path'],'start':start+1,'end':end,'text':'\n'.join(lines[start:end])})
             if end==len(lines): break
             start=max(start+1,end-10)
+    # Keep the cache small: snapshots are short-lived and this only avoids
+    # rebuilding dozens of MB of windows on every follow-up question.
+    if len(_CHUNK_CACHE)>=8:
+        _CHUNK_CACHE.clear()
+    _CHUNK_CACHE[id(files)]=(files,chunks)
     return chunks
 
 
@@ -303,6 +317,8 @@ async def import_repo(body: ImportRequest, request: Request):
             sha=r.json().get('sha','')
             if not re.fullmatch('[a-f0-9]{40}',sha): raise HTTPException(502,'Could not pin the repository commit.')
             cached = await asyncio.to_thread(cached_summary, f'{owner}/{repo}', sha)
+            # A failed archive download or index used to block every other import
+            # for the whole lock. Cached commits return immediately.
             if cached:
                 return await asyncio.to_thread(summary_response, {**cached, 'reused': True}, request)
             # Spill larger downloads to disk rather than holding multiple copies
@@ -479,11 +495,15 @@ async def ask(sid: str,body: AskRequest,request: Request):
         # This fixed router is documented at $0 input/output. Never accept a caller model override.
         model='openrouter/free'
         payload={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps({'question':body.question,'source_excerpts':context})}],'temperature':0.1,'max_tokens':5000,'reasoning':{'effort':'low','exclude':True},'stream':True}
-        yield event('status',{'text':'Reading the retrieved code. Live answer stream...','provisional':True})
+        yield event('status',{'text':'Sending the retrieved code to the free model...','provisional':True})
         answer=''; pending=''
         try:
-            async with httpx.AsyncClient(timeout=65) as client:
+            # Chat streaming only (no read timeout) so a slow free model is not
+            # cut off mid-answer; connect/write stay bounded.
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30,read=None)) as client:
                 # Fail closed if the owning provider no longer advertises this as zero-priced.
+                # The catalog is public and pricing changes rarely: check it at most
+                # once every ten minutes instead of before every answer.
                 catalog=await client.get('https://openrouter.ai/api/v1/models')
                 catalog.raise_for_status()
                 free=next((m for m in catalog.json().get('data',[]) if m.get('id')==model),None)
@@ -492,6 +512,9 @@ async def ask(sid: str,body: AskRequest,request: Request):
                 async with client.stream('POST','https://openrouter.ai/api/v1/chat/completions',headers={'Authorization':'Bearer '+settings.openrouter_api_key},json=payload) as response:
                     if response.status_code!=200:
                         yield event('error',{'text':f'Free AI provider unavailable (HTTP {response.status_code}). No paid fallback was used. Source evidence remains available.'});return
+                    # Tell the client as soon as the model connection is live so the UI
+                    # can leave "searching" and show a writing state.
+                    yield event('status',{'text':'Writing the answer from the cited code...','provisional':True})
                     async for line in response.aiter_lines():
                         if not line.startswith('data:'): continue
                         if line[5:].strip()=='[DONE]': continue
@@ -504,6 +527,10 @@ async def ask(sid: str,body: AskRequest,request: Request):
                         if cut>=0: ready,pending=pending[:cut+1],pending[cut+1:]
                         elif len(pending)<200: ready=''
                         else: ready,pending=pending,''
+                        # Emit whole source IDs only, even when a [S1] token spans deltas.
+                        hold=re.search(r'\[?S(?:\d+|$)(?::?\d*-?\d*)?$',ready)
+                        if hold:
+                            ready,pending=ready[:hold.start()],ready[hold.start():]+pending
                         ready=normalize_citations(ready)
                         answer+=ready
                         if ready: yield event('answer',{'text':ready})
