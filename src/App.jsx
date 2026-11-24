@@ -1,14 +1,5 @@
 import { API_BASE, apiErrorMessage } from "./lib/apiConfig.js";
-import { useEffect, useMemo, useRef, useState } from "react";
-import ReactFlow, {
-  Background,
-  Controls,
-  Handle,
-  Position,
-  ReactFlowProvider,
-  useReactFlow,
-} from "reactflow";
-import "reactflow/dist/style.css";
+import { lazy, Suspense, useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   ArrowUpRight,
@@ -41,7 +32,16 @@ import {
 } from "lucide-react";
 import "./repository.css";
 
-const BASE = `${API_BASE}/repository`;
+// ?api=https://host lets a local frontend talk to a local backend without a rebuild.
+const ORIGIN_OVERRIDE = (() => {
+  try {
+    const value = new URLSearchParams(window.location.search).get("api");
+    return value ? value.trim().replace(/\/+$/, "").replace(/\/api$/, "") : "";
+  } catch {
+    return "";
+  }
+})();
+const BASE = `${ORIGIN_OVERRIDE ? `${ORIGIN_OVERRIDE}/api` : API_BASE}/repository`;
 async function api(path, options) {
   const r = await fetch(BASE + path, options);
   const data = await r.json().catch(() => ({}));
@@ -121,12 +121,16 @@ function PlanSteps({ plan, sources, onSource }) {
   );
 }
 
-function Answer({ text, sources, onSource, blueprint }) {
+function Answer({ text, sources = [], onSource, blueprint }) {
+  const sourceById = useMemo(
+    () => new Map(sources.map((s) => [`[${s.id}]`, s])),
+    [sources],
+  );
   function inline(value) {
     return value
       .split(/(\[S\d+\]|`[^`]+`|\*\*[^*]+\*\*|\*[^*]+\*)/g)
       .map((part, i) => {
-        const source = sources.find((s) => `[${s.id}]` === part);
+        const source = sourceById.get(part);
         if (source)
           return (
             <button
@@ -296,7 +300,7 @@ function StarterPrompts({ project, selected, onPick, onAsk }) {
         : "How do I build a feature like the main entry point here?",
       "Where are errors handled, and what tests cover them?",
     ].filter(Boolean);
-  }, [project]);
+  }, [project, selected]);
 
   return (
     <div className="mf-starters">
@@ -366,81 +370,8 @@ function RetrievalStages({ status, sources }) {
   );
 }
 
-function SourceNode({ data }) {
-  return (
-    <div className={`mf-node ${data.active ? "active" : ""}`}>
-      <Handle type="target" position={Position.Left} />
-      <Handle type="source" position={Position.Right} />
-      <div className="mf-node-top">
-        <FileCode2 size={15} />
-        <span>{data.label}</span>
-        <span className="mf-node-dot" />
-      </div>
-      <div className="mf-node-path">{data.path}</div>
-      <div className="mf-node-foot">
-        {data.citations.join(" · ")}
-        <span>view source ↗</span>
-      </div>
-    </div>
-  );
-}
-function QuestionNode({ data }) {
-  return <div className="mf-question-node"><Handle type="source" position={Position.Right} /><span>QUESTION</span><strong>{data.label}</strong><small>Connected to retrieved source evidence</small></div>;
-}
-const nodeTypes = { source: SourceNode, question: QuestionNode };
-function Diagram({ nodes, edges, onSource, active, fitKey }) {
-  const { fitView } = useReactFlow();
-  useEffect(() => {
-    const id = setTimeout(() => fitView({ padding: 0.2, duration: 350 }), 70);
-    return () => clearTimeout(id);
-  }, [nodes.length, fitKey, fitView]);
-  useEffect(() => {
-    let timer;
-    const resize = () => {
-      clearTimeout(timer);
-      timer = setTimeout(() => fitView({ padding: 0.2, duration: 200 }), 150);
-    };
-    window.addEventListener("resize", resize);
-    return () => {
-      clearTimeout(timer);
-      window.removeEventListener("resize", resize);
-    };
-  }, [fitView]);
-  const rendered = useMemo(() => {
-    // A compact reading-order layout, not a claim about runtime sequence.
-    const columns = Math.max(1, Math.ceil(nodes.length / 4)),
-      rows = Math.ceil(nodes.length / columns);
-    return nodes.map((n, i) => ({
-      id: n.id,
-      type: n.kind === "question" ? "question" : "source",
-      position: n.kind === "question" ? { x: 0, y: 160 } : { x: 360 + Math.floor((i - 1) / rows) * 310, y: ((i - 1) % rows) * 145 },
-      data: { ...n, active: active === n.path },
-    }));
-  }, [nodes, edges, active]);
-  return (
-    <ReactFlow
-      nodes={rendered}
-      edges={edges.map((e) => ({
-        ...e,
-        animated: true,
-        label: e.kind === "evidence" ? "source evidence" : `imports · L${e.line}`,
-        style: { stroke: "#b07a57", strokeWidth: 1.6 },
-        labelStyle: { fill: "#745b47", fontSize: 10 },
-        labelBgStyle: { fill: "#fbf8f1" },
-      }))}
-      onNodeClick={(_, n) => n.data.path && onSource(n.data.path)}
-      nodeTypes={nodeTypes}
-      fitView
-      minZoom={0.25}
-      maxZoom={1.6}
-      proOptions={{ hideAttribution: true }}
-      nodesDraggable
-    >
-      <Background gap={22} size={1} color="#e8e1d4" />
-      <Controls showInteractive={false} />
-    </ReactFlow>
-  );
-}
+const AnswerDiagram = lazy(() => import("./components/AnswerDiagram.jsx"));
+
 function SourceSheet({ source, close }) {
   const target = useRef(null);
   useEffect(() => {
@@ -680,13 +611,25 @@ function RepositoryApp() {
     [focus, setFocus] = useState("");
   const [graphId, setGraphId] = useState(null);
   const [fileLimit, setFileLimit] = useState(100);
-  const filteredFiles = useMemo(() => (project?.files || []).filter(f => f.path.toLowerCase().includes(filter.toLowerCase())), [project, filter]);
-  useEffect(() => setFileLimit(100), [filter, project]);
+  const deferredFilter = useDeferredValue(filter);
+  const filteredFiles = useMemo(() => (project?.files || []).filter(f => f.path.toLowerCase().includes(deferredFilter.toLowerCase())), [project, deferredFilter]);
+  useEffect(() => setFileLimit(100), [deferredFilter, project]);
   const end = useRef(null),
-    controller = useRef(null);
-  useEffect(() => () => controller.current?.abort(), []);
+    controller = useRef(null),
+    scrollTimer = useRef(0),
+    fileCache = useRef(new Map());
+  useEffect(() => () => {
+    controller.current?.abort();
+    clearTimeout(scrollTimer.current);
+  }, []);
   useEffect(() => {
-    end.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    // Streaming updates arrive continuously. Scrolling on every delta fights
+    // the browser's layout work, so coalesce them into a short trailing scroll.
+    if (scrollTimer.current) return;
+    scrollTimer.current = setTimeout(() => {
+      scrollTimer.current = 0;
+      end.current?.scrollIntoView({ block: "end" });
+    }, 120);
   }, [messages, status]);
   useEffect(() => {
     // Time the free-model check: it is a network round-trip to the backend,
@@ -721,7 +664,9 @@ function RepositoryApp() {
     setLoading(true);
     try {
       const p = await api("/import", post({ url: value || url }));
+      if (!p || !Array.isArray(p.files)) throw new Error(document.querySelector(".mf-toast")?.textContent || "The importer returned no file list for this repository.");
       setProject(p);
+      fileCache.current.clear();
       setFocus(
         p.files.find(
           (f) => f.path.startsWith("src/") && /\.(jsx?|tsx?|py)$/.test(f.path),
@@ -744,9 +689,17 @@ function RepositoryApp() {
   async function openSource(path, start = 1, endLine = 0) {
     if (!project) return;
     try {
-      const file = await api(
-        `/${project.id}/file?path=${encodeURIComponent(path)}`,
-      );
+      const key = `${project.id}:${path}`;
+      let file = fileCache.current.get(key);
+      if (!file) {
+        file = await api(
+          `/${project.id}/file?path=${encodeURIComponent(path)}`,
+        );
+        // Keep a bounded client cache: clicking the same cited file repeatedly
+        // should not re-download a large source file each time.
+        if (fileCache.current.size > 40) fileCache.current.clear();
+        fileCache.current.set(key, file);
+      }
       setActive(path);
       setSource({
         ...file,
@@ -816,17 +769,58 @@ function RepositoryApp() {
       );
     controller.current = new AbortController();
     let completed = false;
+    // Model deltas arrive far faster than a browser can paint. Coalesce them so
+    // the chat does not re-render (and re-parse the whole answer) per token.
+    let pendingAnswer = "";
+    let flushTimer = 0;
+    const flushAnswer = () => {
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = 0;
+      }
+      if (!pendingAnswer) return;
+      const chunk = pendingAnswer;
+      pendingAnswer = "";
+      update((m) => ({
+        text: m.text + chunk,
+        ttftMs: m.ttftMs ?? Date.now() - startedAt,
+      }));
+    };
+    const queueAnswer = (text) => {
+      pendingAnswer += text;
+      if (!flushTimer) flushTimer = setTimeout(flushAnswer, 40);
+    };
+    const discardAnswer = () => {
+      pendingAnswer = "";
+      if (flushTimer) {
+        clearTimeout(flushTimer);
+        flushTimer = 0;
+      }
+    };
     // "How do I build X?" goes to the blueprint endpoint: it returns a verified
-    // step plan and snippets before the model writes anything.
-    const endpoint = looksLikeBuildQuestion(question) ? "build" : "ask";
+    // step plan and snippets before the model writes anything. The documented
+    // route is /{id}/build; a gateway that mounts it at /build/{id} is tried
+    // second, and an older backend falls through to the normal Ask route.
+    const wantsBuild = looksLikeBuildQuestion(question);
+    const candidates = wantsBuild
+      ? [`${project.id}/build`, `build/${project.id}`, `${project.id}/ask`]
+      : [`${project.id}/ask`];
     try {
-      const response = await fetch(`${BASE}/${project.id}/${endpoint}`, {
-        ...post({ question: contextualQuestion }),
-        signal: controller.current.signal,
-      });
-      if (!response.ok) {
+      let response = null;
+      let path = candidates[0];
+      for (const candidate of candidates) {
+        path = candidate;
+        response = await fetch(`${BASE}/${path}`, {
+          ...post({ question: contextualQuestion }),
+          signal: controller.current.signal,
+        });
+        if (response.ok || (response.status !== 404 && response.status !== 405)) break;
+        // Drain the tiny not-found body before trying the alternate route.
+        await response.clone().text().catch(() => "");
+      }
+      if (!response?.ok) {
         const d = await response.json().catch(() => ({}));
-        throw new Error(apiErrorMessage(response.status, d.detail, `/api/repository/${project.id}/${endpoint}`));
+        throw new Error(apiErrorMessage(response.status, d.detail, `/api/repository/${path}`));
       }
       const reader = response.body.getReader(),
         decoder = new TextDecoder();
@@ -894,17 +888,14 @@ function RepositoryApp() {
             repaint();
           }
           if (type === "graph_info") setGraphInfo(data.text);
-          if (type === "answer")
-            update((m) => ({
-              text: m.text + data.text,
-              // First visible token ends the wait; record how long it took.
-              ttftMs: m.ttftMs ?? Date.now() - startedAt,
-            }));
+          if (type === "answer") queueAnswer(data.text);
           if (type === "error" || type === "invalid") {
+            discardAnswer();
             update({ text: data.text, failed: true, provisional: false });
             completed = true;
           }
           if (type === "done") {
+            flushAnswer();
             update({
               provisional: false,
               provider: data.provider,
@@ -921,6 +912,7 @@ function RepositoryApp() {
           "The answer stream ended early. Ask again; the incomplete draft was hidden.",
         );
     } catch (e) {
+      discardAnswer();
       update({
         text:
           e.name === "AbortError"
@@ -930,6 +922,7 @@ function RepositoryApp() {
         provisional: false,
       });
     } finally {
+      discardAnswer();
       if (controller.current?.signal.aborted) {
         update((m) =>
           m.provisional ? { provisional: false, stopped: true } : {},
@@ -942,6 +935,7 @@ function RepositoryApp() {
   }
   function reset() {
     controller.current?.abort();
+    fileCache.current.clear();
     setBusy(false);
     setProject(null);
     setMessages([]);
@@ -958,6 +952,19 @@ function RepositoryApp() {
     project?.files[0]?.path ||
     "";
   const shown = messages.filter((m) => (m.tab || "ask") === tab);
+  // A <select> with tens of thousands of <option>s stalls the browser. Show a
+  // bounded list for large repositories; the left file list still reaches every
+  // file, and the current selection is always kept.
+  const toolFiles = useMemo(() => {
+    const files = project?.files || [];
+    if (files.length <= 400) return files;
+    const head = files.slice(0, 400);
+    if (selected && !head.some((f) => f.path === selected)) {
+      const current = files.find((f) => f.path === selected);
+      if (current) return [current, ...head];
+    }
+    return head;
+  }, [project, selected]);
   function task(mode) {
     const prompts = {
       explain: `Explain the implementation in ${selected}, in simple English and then technical detail. Follow related files when needed. Cite actual code.`,
@@ -1077,15 +1084,22 @@ function RepositoryApp() {
             <span className="mf-map-badge">ANSWER MAP</span>
           </div>
           {nodes.length ? (
-            <ReactFlowProvider>
-              <Diagram
+            <Suspense
+              fallback={
+                <div className="mf-canvas-empty">
+                  <Loader2 className="mf-spin" />
+                  <h3>Building the source map…</h3>
+                </div>
+              }
+            >
+              <AnswerDiagram
                 nodes={nodes}
                 edges={edges}
                 onSource={openSource}
                 active={active}
                 fitKey={fitKey}
               />
-            </ReactFlowProvider>
+            </Suspense>
           ) : (
             <div className="mf-canvas-empty">
               <div className="mf-empty-symbol">
@@ -1183,12 +1197,18 @@ function RepositoryApp() {
                 value={selected}
                 onChange={(e) => setFocus(e.target.value)}
               >
-                {project.files.map((f) => (
+                {toolFiles.map((f) => (
                   <option key={f.path} value={f.path}>
                     {f.path}
                   </option>
                 ))}
               </select>
+              {toolFiles.length < (project.files?.length || 0) && (
+                <p>
+                  Showing {toolFiles.length} of {project.files.length} files. Pick
+                  any other file from the repository list on the left.
+                </p>
+              )}
               {tab !== "video" && (
                 <>
                   <p>

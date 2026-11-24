@@ -91,10 +91,34 @@ def test_unknown_terms_return_no_evidence():
     assert r.retrieve(sample(),'pterodactylquasar')==[]
 
 
+def test_explicit_symbol_check_narrows_scan_without_false_missing():
+    data=r.index_archive(archive({'src/handler.ts':'export function uploadDocument(file) { return file }\n',
+                                   'src/store.py':'def save_message(message):\n    return message\n'}),'x','y','c'*40)
+    assert r._explicit_missing(data,'Where is uploadDocument implemented?') is False
+    assert r._explicit_missing(data,'Where is save_message implemented?') is False
+    assert r._explicit_missing(data,'Where is missingUploadHandler implemented?') is True
+    assert r._explicit_missing(data,'Where is totallyAbsentSymbol implemented?') is True
+
+
+def test_build_capability_probe_is_available():
+    app=FastAPI(); app.include_router(r.router)
+    with TestClient(app) as client:
+        response=client.post('/api/repository/build/ping')
+    assert response.status_code==200
+    assert response.json()=={'build':True}
+
+
 def test_save_load_and_no_source_leak_in_summary():
     d=sample();r.save(d)
     assert r.load(d['id'])['files']==d['files']
     assert all('text' not in f for f in r.public(d)['files'])
+
+
+def test_snapshot_load_is_memoised_for_follow_up_questions():
+    d=sample();r.save(d);r._LOAD_CACHE.clear()
+    first=r.load(d['id'])
+    second=r.load(d['id'])
+    assert second is first
 
 
 def test_malformed_snapshot_id():
@@ -395,18 +419,31 @@ def test_source_id_split_across_deltas_is_never_cut():
 def test_retrieval_reuses_windows_for_follow_up_questions(monkeypatch):
     data = sample()
     r._CHUNK_CACHE.clear()
+    r._INDEX_CACHE.clear()
     calls = []
+    token_calls = []
     real = r.build_chunks
+    real_tokens = r.tokens
 
     def counting(files):
         calls.append(1)
         return real(files)
 
+    def counting_tokens(text):
+        token_calls.append(1)
+        return real_tokens(text)
+
     monkeypatch.setattr(r, 'build_chunks', counting)
+    monkeypatch.setattr(r, 'tokens', counting_tokens)
     r.retrieve(data, 'send chat')
+    first = len(token_calls)
     r.retrieve(data, 'save message')
-    assert len(calls) == 2
+    # The windows and the tokenised index are built once per snapshot, not once
+    # per question. The second retrieval only tokenises the new question itself.
+    assert len(calls) == 1
+    assert len(token_calls) - first == 1
     monkeypatch.setattr(r, 'build_chunks', real)
+    monkeypatch.setattr(r, 'tokens', real_tokens)
     assert r._CHUNK_CACHE and list(r._CHUNK_CACHE.values())[-1][1]
     assert all('id' not in chunk for chunk in list(r._CHUNK_CACHE.values())[-1][1])
 

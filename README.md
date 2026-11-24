@@ -58,3 +58,5 @@ Snapshot JSON is compressed in SQLite; existing uncompressed snapshots remain re
 ## Faster project loading
 
 Importing an unchanged commit reuses its saved snapshot instead of downloading the archive again. A separate lightweight summary lets saved workspaces open without decompressing the full repository source. Summary responses use gzip when the browser supports it and send an import-connection count instead of the entire graph; individual answer graphs still include their actual edges. New repositories still need an initial download and indexing pass.
+
+Follow-up questions reuse the decompressed snapshot, its retrieval windows, token index and grouped import edges, so only the new question is scored. Streamed model text is coalesced before rendering, the graph library is loaded only when an answer map is shown, and build questions fall back to normal Ask when a backend does not serve the blueprint route. See `backend/README.md` for the backend latency patches.

@@ -42,6 +42,18 @@ SENSITIVE = re.compile(r'(^|/)(\.env($|\.)|id_rsa|id_ed25519|credentials($|\.)|s
 REQUESTS = collections.defaultdict(collections.deque)
 IMPORT_LOCK = asyncio.Lock()
 
+# Compiled once. Tokenisation runs over every indexed file, so avoiding a fresh
+# regex compile for each word is a measurable win on large snapshots.
+_CAMEL_ACRONYM = re.compile(r'([A-Z]+)([A-Z][a-z])')
+_CAMEL_BOUNDARY = re.compile(r'([a-z0-9])([A-Z])')
+_WORD = re.compile(r'[a-zA-Z][a-zA-Z0-9]{1,}')
+_DECLARATION = re.compile(r'(?:def|function|func)\s+([A-Za-z_$][\w$]*)|(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(')
+QUERY_STOPWORDS = {
+    'how','what','where','when','why','which','does','this','that','the','and','are',
+    'for','with','from','can','you','please','work','works','repository','repo','code',
+    'actually','here','about','explain',
+}
+
 
 def connection():
     con=sqlite3.connect(DB_PATH)
@@ -63,14 +75,49 @@ def save(data):
         con.execute('INSERT INTO code_snapshots VALUES (?,?,?)',(data['id'],time.time(),zlib.compress(json.dumps(data).encode('utf-8'), level=6)))
 
 
+# Follow-up questions re-open the same snapshot. Decompressing and parsing the
+# full JSON again is pure latency, so keep a tiny LRU of recently opened
+# snapshots. The cap is deliberately small: these are large public repositories.
+_LOAD_CACHE = collections.OrderedDict()
+_LOAD_CACHE_MAX = 2
+_LOAD_CACHE_BYTES = 400_000_000
+_LOAD_CACHE_SIZE = 0
+
+
+def _remember_snapshot(sid, data):
+    global _LOAD_CACHE_SIZE
+    if sid in _LOAD_CACHE: return
+    size = data.get('coverage', {}).get('indexed_bytes', 0) or 0
+    _LOAD_CACHE[sid] = data
+    _LOAD_CACHE_SIZE += size
+    while len(_LOAD_CACHE) > _LOAD_CACHE_MAX or (
+        _LOAD_CACHE_SIZE > _LOAD_CACHE_BYTES and len(_LOAD_CACHE) > 1
+    ):
+        _, old = _LOAD_CACHE.popitem(last=False)
+        _LOAD_CACHE_SIZE -= old.get('coverage', {}).get('indexed_bytes', 0) or 0
+        # Drop the derived caches too, otherwise an evicted snapshot's chunks and
+        # token counters would keep hundreds of MB alive.
+        files = old.get('files')
+        if files is not None:
+            _INDEX_CACHE.pop(id(files), None)
+            _CHUNK_CACHE.pop(id(files), None)
+        _EDGE_CACHE.pop(id(old.get('edges')), None)
+
+
 def load(sid):
     if not re.fullmatch(r'[a-f0-9-]{36}',sid):
         raise HTTPException(404,'Snapshot not found. Import the public repository again.')
+    cached=_LOAD_CACHE.get(sid)
+    if cached is not None:
+        _LOAD_CACHE.move_to_end(sid)
+        return cached
     with connection() as con:
         row=con.execute('SELECT data FROM code_snapshots WHERE id=?',(sid,)).fetchone()
     if not row: raise HTTPException(404,'Snapshot expired. Import the public repository again.')
     stored = row['data']
-    return json.loads(zlib.decompress(stored) if isinstance(stored, bytes) else stored)
+    data = json.loads(zlib.decompress(stored) if isinstance(stored, bytes) else stored)
+    _remember_snapshot(sid,data)
+    return data
 
 
 def load_summary(sid):
@@ -135,9 +182,9 @@ def exclusion(path):
 
 
 def tokens(text):
-    text=re.sub(r'([A-Z]+)([A-Z][a-z])',r'\1 \2',text)
-    text=re.sub(r'([a-z0-9])([A-Z])',r'\1 \2',text)
-    words = re.findall(r'[a-zA-Z][a-zA-Z0-9]{1,}',text.lower().replace('_',' '))
+    text=_CAMEL_ACRONYM.sub(r'\1 \2',text)
+    text=_CAMEL_BOUNDARY.sub(r'\1 \2',text)
+    words = _WORD.findall(text.lower().replace('_',' '))
     # Small deterministic morphology expansion keeps code identifiers and natural
     # queries aligned (importing/import, requests/request, handled/handle).
     result = []
@@ -176,10 +223,56 @@ def build_chunks(files):
             start=max(start+1,end-10)
     # Keep the cache small: snapshots are short-lived and this only avoids
     # rebuilding dozens of MB of windows on every follow-up question.
-    if len(_CHUNK_CACHE)>=8:
+    if len(_CHUNK_CACHE)>=3:
         _CHUNK_CACHE.clear()
     _CHUNK_CACHE[id(files)]=(files,chunks)
     return chunks
+
+
+# Tokenising every chunk of a repository on every question was the dominant
+# retrieval cost. The per-snapshot index below keeps the windows, term counts,
+# path terms and declaration names so follow-up questions only score.
+_INDEX_CACHE={}
+
+
+def build_index(files):
+    cached=_INDEX_CACHE.get(id(files))
+    if cached is not None and cached[0] is files: return cached[1]
+    chunks=build_chunks(files)
+    docs=[]; path_terms=[]; declared=[]; lengths=[]; total_terms=0
+    for c in chunks:
+        counter=collections.Counter(tokens(c['path']+' '+c['text']))
+        docs.append(counter)
+        length=sum(counter.values()); lengths.append(length); total_terms+=length
+        path_terms.append(set(tokens(c['path'])))
+        names=_DECLARATION.findall(c['text'])
+        declared.append(set(tokens(' '.join(a or b for a,b in names))))
+    index={'chunks':chunks,'docs':docs,'path_terms':path_terms,
+           'declared':declared,'lengths':lengths,'total_terms':total_terms}
+    # Keep memory bounded. The snapshot itself is already in the load cache, so
+    # only a couple of active repositories need a full index at once.
+    if len(_INDEX_CACHE)>=3: _INDEX_CACHE.clear()
+    _INDEX_CACHE[id(files)]=(files,index)
+    return index
+
+
+# Import edges are scanned repeatedly by retrieval, the evidence graph and the
+# build planner. Group them once per snapshot instead of walking the full edge
+# list for each retrieved file.
+_EDGE_CACHE={}
+
+
+def edge_index(edges):
+    cached=_EDGE_CACHE.get(id(edges))
+    if cached is not None and cached[0] is edges: return cached[1]
+    by_source=collections.defaultdict(list); by_target=collections.defaultdict(list)
+    for e in edges:
+        by_source[e['source']].append(e)
+        by_target[e['target']].append(e)
+    result=(by_source,by_target)
+    if len(_EDGE_CACHE)>=4: _EDGE_CACHE.clear()
+    _EDGE_CACHE[id(edges)]=(edges,result)
+    return result
 
 
 def resolve_import(path, target, paths, aliases=None):
@@ -330,11 +423,16 @@ async def import_repo(body: ImportRequest, request: Request):
                 archive.seek(0)
                 data=await asyncio.to_thread(index_archive,archive,owner,repo,sha)
         await asyncio.to_thread(save,data)
+        # The freshly indexed snapshot is already in memory; keep it there so the
+        # first question does not decompress and re-parse the whole repository.
+        await asyncio.to_thread(_remember_snapshot,data['id'],data)
         return await asyncio.to_thread(summary_response, {**public(data), 'reused': False}, request)
 
 
 CATALOG={'at':0.0,'ok':None}
 CATALOG_TTL=600
+STATUS_CACHE={'at':0.0,'value':None}
+STATUS_TTL=60
 
 
 async def free_route_verified(client):
@@ -353,18 +451,36 @@ async def free_route_verified(client):
     return CATALOG['ok']
 
 
+@router.post('/build/ping')
+async def build_ping():
+    # Cheap capability probe so the frontend can fall back to Ask on older
+    # backends without making a doomed build request first.
+    return {'build':True}
+
+
 @router.get('/status')
 async def provider_status():
+    now=time.time()
+    if STATUS_CACHE['value'] is not None and now-STATUS_CACHE['at']<STATUS_TTL:
+        return STATUS_CACHE['value']
     if not settings.openrouter_api_key:
-        return {'ready':False,'model':'openrouter/free','reason':'No OpenRouter key configured. Source search still works.'}
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            r=await client.get('https://openrouter.ai/api/v1/key',headers={'Authorization':'Bearer '+settings.openrouter_api_key})
-            if r.status_code!=200: return {'ready':False,'reason':f'Key check HTTP {r.status_code}','model':'openrouter/free'}
-            d=r.json().get('data',{})
-            return {'ready':True,'model':'openrouter/free','free_model_daily_requests':d.get('free_model_daily_requests'),'is_free_tier':d.get('is_free_tier'),'note':'Zero-priced model route only. No paid fallback. Availability and shared free quotas can vary.'}
-    except httpx.HTTPError:
-        return {'ready':False,'reason':'Free provider status unavailable','model':'openrouter/free'}
+        result={'ready':False,'model':'openrouter/free','reason':'No OpenRouter key configured. Source search still works.'}
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                r=await client.get('https://openrouter.ai/api/v1/key',headers={'Authorization':'Bearer '+settings.openrouter_api_key})
+                if r.status_code!=200:
+                    result={'ready':False,'reason':f'Key check HTTP {r.status_code}','model':'openrouter/free'}
+                else:
+                    d=r.json().get('data',{})
+                    result={'ready':True,'model':'openrouter/free','free_model_daily_requests':d.get('free_model_daily_requests'),'is_free_tier':d.get('is_free_tier'),'note':'Zero-priced model route only. No paid fallback. Availability and shared free quotas can vary.'}
+                    # Warm the zero-price catalog check while the page is idle so
+                    # the first answer does not pay for this extra round-trip.
+                    await free_route_verified(client)
+        except httpx.HTTPError:
+            result={'ready':False,'reason':'Free provider status unavailable','model':'openrouter/free'}
+    STATUS_CACHE['value']=result; STATUS_CACHE['at']=now
+    return result
 
 
 @router.get('/{sid}')
@@ -386,7 +502,7 @@ async def export_documentation(sid: str, bundle: bool = False):
 
 @router.get('/{sid}/file')
 async def source(sid: str,path: str):
-    data=load(sid)
+    data=await asyncio.to_thread(load, sid)
     f=next((f for f in data['files'] if f['path']==path),None)
     if not f: raise HTTPException(404,'File not indexed in this snapshot.')
     return f
@@ -395,26 +511,25 @@ async def source(sid: str,path: str):
 def retrieve_raw(data,question,limit=12,cap=38000):
     """Ranked windows without IDs/URLs, so callers can chain steps and re-retrieve."""
     if _explicit_missing(data,question): return []
-    chunks=build_chunks(data['files'])
-    terms=set(tokens(question))-{'how','what','where','when','why','which','does','this','that','the','and','are','for','with','from','can','you','please','work','works','repository','repo','code','actually','here','about','explain'}
+    index=build_index(data['files'])
+    chunks=index['chunks']; docs=index['docs']
+    terms=set(tokens(question))-QUERY_STOPWORDS
     if not terms: return []
-    docs=[collections.Counter(tokens(c['path']+' '+c['text'])) for c in chunks]
     freq=collections.Counter(t for d in docs for t in terms if t in d)
-    avg=sum(sum(d.values()) for d in docs)/max(1,len(docs))
+    avg=index['total_terms']/max(1,len(docs))
     scored=[]
-    for c,d in zip(chunks,docs):
-        length=sum(d.values()); score=0
+    for i,(c,d) in enumerate(zip(chunks,docs)):
+        length=index['lengths'][i]; score=0
+        path_terms=index['path_terms'][i]
         for t in terms:
             tf=d[t]
             if tf:
                 idf=math.log(1+(len(docs)-freq[t]+0.5)/(freq[t]+0.5))
                 score+=idf*tf*2.2/(tf+1.2*(.25+.75*length/max(1,avg)))
-                if t in tokens(c['path']): score+=1.5
+                if t in path_terms: score+=1.5
         # Executable declaration names carry stronger intent than UI labels or
         # repeated import syntax. This is lexical symbol evidence, not a runtime claim.
-        declarations = re.findall(r'(?:def|function|func)\s+([A-Za-z_$][\w$]*)|(?:const|let)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?\(', c['text'])
-        declared_terms = set(tokens(' '.join(a or b for a,b in declarations)))
-        score += min(24, 8 * len(declared_terms & terms))
+        score += min(24, 8 * len(index['declared'][i] & terms))
         # Explicit paths anchor cross-file questions instead of drowning in repeated route terms.
         if c['path'].lower() in question.lower(): score+=30
         # Code is primary evidence. Documentation remains searchable but never substitutes for code.
@@ -432,25 +547,42 @@ def retrieve_raw(data,question,limit=12,cap=38000):
         if any(x['path']==c['path'] and max(0,min(c['end'],x['end'])-max(c['start'],x['start'])+1) / max(1,c['end']-c['start']+1) > .6 for x in chosen): continue
         chosen.append(dict(c)); context_bytes+=size
         if len(chosen)>=limit: break
+    file_map={f['path']:f for f in data['files']}
     # Add import-site evidence for connections among the retrieved files.
     paths={c['path'] for c in chosen}
-    for edge in data['edges']:
-        if edge['source'] in paths and edge['target'] in paths and not any(c['path']==edge['source'] and c['start']<=edge['line']<=c['end'] for c in chosen):
-            f=next(f for f in data['files'] if f['path']==edge['source'])
+    by_source,_=edge_index(data['edges'])
+    for source in dict.fromkeys(c['path'] for c in chosen):
+        for edge in by_source.get(source,()):
+            if edge['target'] not in paths: continue
+            if any(c['path']==edge['source'] and c['start']<=edge['line']<=c['end'] for c in chosen): continue
+            f=file_map.get(edge['source'])
+            if not f: continue
             lines=f['text'].splitlines(); n=edge['line']
             chosen.append({'path':f['path'],'start':max(1,n-2),'end':min(len(lines),n+2),'text':'\n'.join(lines[max(0,n-3):n+2])})
             if len(chosen)>=16: break
+        if len(chosen)>=16: break
     # One contiguous excerpt per file where it fits reduces ambiguous IDs for adjacent windows.
     merged=[]
     for path in dict.fromkeys(c['path'] for c in chosen):
         group=[c for c in chosen if c['path']==path]
         first=min(c['start'] for c in group); last=max(c['end'] for c in group)
-        source=next(f for f in data['files'] if f['path']==path)
+        source=file_map.get(path)
+        if not source: merged.extend(group); continue
         text='\n'.join(source['text'].splitlines()[first-1:last])
         if len(text)<=12000 and sum(len(c['text']) for c in merged)+len(text)<=cap:
             merged.append({'path':path,'start':first,'end':last,'text':text})
         else: merged.extend(group)
     return merged
+
+
+def symbol_candidates(data,symbol):
+    """Files that could contain an exact identifier, narrowed by token index."""
+    plain=_CAMEL_BOUNDARY.sub(r'\1 \2',_CAMEL_ACRONYM.sub(r'\1 \2',symbol))
+    parts={w.lower() for w in _WORD.findall(plain.replace('_',' ').replace('$',' '))}
+    file_map={f['path']:f for f in data['files']}
+    if not parts: return list(file_map.values())
+    index=build_index(data['files'])
+    return [file_map[p] for p in {c['path'] for c,d in zip(index['chunks'],index['docs']) if parts.issubset(d)} if p in file_map]
 
 
 def _explicit_missing(data,question):
@@ -461,7 +593,8 @@ def _explicit_missing(data,question):
     # A plain English word ("a", "search") is not a symbol claim: only names with
     # an identifier shape (snake, camel, ALLCAPS, underscore) get the hard check.
     if not re.search(r'[_$]|[a-z][A-Z]',symbol) and symbol.lower()==symbol: return False
-    return not any(re.search(r'(?<![\w$])'+re.escape(symbol)+r'(?![\w$])',f['text']) for f in data['files'])
+    pattern=re.compile(r'(?<![\w$])'+re.escape(symbol)+r'(?![\w$])')
+    return not any(pattern.search(f['text']) for f in symbol_candidates(data,symbol))
 
 
 def with_ids(data,chosen):
@@ -478,8 +611,15 @@ def retrieve(data,question,limit=12):
 
 def evidence_graph(data, snippets):
     paths=list(dict.fromkeys(c['path'] for c in snippets))
+    path_set=set(paths)
     nodes=[{'id':p,'label':p.split('/')[-1],'path':p,'citations':[c['id'] for c in snippets if c['path']==p]} for p in paths]
-    edges=[{**e,'id':f'e{i}'} for i,e in enumerate(data['edges']) if e['source'] in paths and e['target'] in paths and any(c['path']==e['source'] and c['start']<=e['line']<=c['end'] for c in snippets)]
+    by_source,_=edge_index(data['edges'])
+    edges=[]
+    for i,source in enumerate(paths):
+        for e in by_source.get(source,()):
+            if e['target'] not in path_set: continue
+            if not any(c['path']==e['source'] and c['start']<=e['line']<=c['end'] for c in snippets): continue
+            edges.append({**e,'id':f'e{i}-{len(edges)}'})
     return {'nodes':nodes,'edges':edges,'kind':'Source import map, not an observed runtime trace. Python AST and JS/TS static import detection; dynamic imports, aliases and other languages may be missing.'}
 
 
@@ -523,6 +663,8 @@ def model_payload(question,snippets,effort='low'):
 async def deltas(response):
     """Yield cleaned text deltas: whole tokens only, never a truncated [S1]."""
     pending=''
+    ready_buffer=''
+    last_flush=time.monotonic()
     async for line in response.aiter_lines():
         if not line.startswith('data:'): continue
         if line[5:].strip()=='[DONE]': continue
@@ -536,10 +678,19 @@ async def deltas(response):
         hold=re.search(r'\[?S(?:\d+|$)(?::?\d*-?\d*)?$',ready)
         if hold: ready,pending=ready[:hold.start()],hold.group(0)+pending
         ready=normalize_citations(ready)
-        if ready: yield ready
+        if ready: ready_buffer+=ready
+        # Upstream emits roughly one event per word. Coalesce them so the browser
+        # parses a few dozen SSE packets instead of hundreds, without delaying
+        # the first visible text by more than a frame.
+        now=time.monotonic()
+        if ready_buffer and (len(ready_buffer)>=400 or now-last_flush>=0.08):
+            yield ready_buffer
+            ready_buffer=''
+            last_flush=now
     if pending:
         ready=normalize_citations(pending)
-        if ready: yield ready
+        if ready: ready_buffer+=ready
+    if ready_buffer: yield ready_buffer
 
 
 async def answer_text(client,question,snippets,effort='low',sink=None):
@@ -633,7 +784,6 @@ def review_clusters(files):
 
 def review_retrieval(data,clusters):
     """Retrieve related baseline source, and flag added symbols no other file uses."""
-    index={f['path']:f['text'] for f in data['files']}
     found=[]
     for c in clusters:
         for term in c['terms'][:3]:
@@ -644,8 +794,8 @@ def review_retrieval(data,clusters):
         novel=[]
         for name in c['symbols'][:8]:
             if not re.fullmatch(r'[A-Za-z_$][\w$]{2,}',name): continue
-            pattern=r'(?<![\w$])'+re.escape(name)+r'(?![\w$])'
-            if not any(re.search(pattern,t) for p,t in index.items() if p!=c['path']): novel.append(name)
+            pattern=re.compile(r'(?<![\w$])'+re.escape(name)+r'(?![\w$])')
+            if not any(pattern.search(f['text']) for f in symbol_candidates(data,name) if f['path']!=c['path']): novel.append(name)
         c['novel']=novel
     seen=set(); unique=[]
     for s in found:
@@ -846,9 +996,11 @@ def plan_steps(data,feature,limit=MAX_STEPS):
         by_file.setdefault(chunk['path'],[]).append(chunk)
     paths=list(by_file)
     known={f['path'] for f in data['files']}
+    path_set=set(paths)
+    by_source,by_target=edge_index(data['edges'])
     # Observed dependency order: a file comes after the files it imports inside
     # the retrieved set. Cycles fall back to retrieval rank.
-    deps={p:{e['target'] for e in data['edges'] if e['source']==p and e['target'] in known} & set(paths) for p in paths}
+    deps={p:{e['target'] for e in by_source.get(p,()) if e['target'] in known} & path_set for p in paths}
     order=[]; remaining=list(paths)
     while remaining:
         ready=[p for p in remaining if not (deps[p] & set(remaining))]
@@ -858,8 +1010,8 @@ def plan_steps(data,feature,limit=MAX_STEPS):
     for path in order:
         windows=by_file[path]
         name=PurePosixPath(path).name
-        imports=sorted({e['target'] for e in data['edges'] if e['source']==path and e['target'] in known})
-        used_by=sorted({e['source'] for e in data['edges'] if e['target']==path})
+        imports=sorted({e['target'] for e in by_source.get(path,()) if e['target'] in known})
+        used_by=sorted({e['source'] for e in by_target.get(path,())})
         for chunk in windows[:2]:
             text,end=_trim_to_lines(chunk['text'],chunk['start'],STEP_BYTES)
             if not text.strip(): continue

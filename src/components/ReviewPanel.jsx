@@ -119,6 +119,8 @@ export default function ReviewPanel({ project, onSource }) {
   const abort = useRef(null);
   const resultRef = useRef(null);
   const startedAt = useRef(0);
+  const streamedRef = useRef("");
+  const filesRef = useRef(null);
 
   useEffect(() => () => abort.current?.abort(), []);
   useEffect(() => {
@@ -150,6 +152,7 @@ export default function ReviewPanel({ project, onSource }) {
     abort.current?.abort();
     abort.current = new AbortController();
     startedAt.current = performance.now();
+    streamedRef.current = "";
     setState("running");
     setStage("fetching");
     setError("");
@@ -162,15 +165,25 @@ export default function ReviewPanel({ project, onSource }) {
     setTiming(null);
 
     try {
-      const response = await fetch(`${BASE}/${project.id}/pull-request`, {
+      // Gateways that patch locally expose /build/{id}; a deployed patched
+      // backend serves /{id}/pull-request. Either shape must work.
+      let response = await fetch(`${BASE}/pr/${project.id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url: nextUrl.trim(), question_key: key }),
         signal: abort.current.signal,
-      });
+      }).catch(() => null);
+      if (!response || response.status === 404 || response.status === 405) {
+        response = await fetch(`${BASE}/${project.id}/pull-request`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: nextUrl.trim(), question_key: key }),
+          signal: abort.current.signal,
+        });
+      }
       if (!response.ok) {
         const detail = await response.json().catch(() => ({}));
-        throw new Error(apiErrorMessage(response.status, detail.detail, `/api/repository/${project.id}/pull-request`));
+        throw new Error(apiErrorMessage(response.status, detail.detail, `/api/repository/pull-request`));
       }
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -190,6 +203,7 @@ export default function ReviewPanel({ project, onSource }) {
           if (type === "status") setStage((s) => (s === "fetching" ? "diff" : s === "diff" ? "search" : "model"));
           if (type === "pr") setStage("fetching");
           if (type === "pr_files") {
+            filesRef.current = data;
             setFiles(data);
             setStage("search");
           }
@@ -217,9 +231,27 @@ export default function ReviewPanel({ project, onSource }) {
             setState((s) => (s === "running" ? "failed" : s));
             finished = true;
           }
+          // A gateway may deliver the prose as streamed 'answer' events instead
+          // of a single 'review' event, while the local events carry the files
+          // and checks. Collect the prose so either shape completes cleanly.
+          if (type === "answer" && !finished) {
+            streamedRef.current = (streamedRef.current || "") + (data.text || "");
+            setText(streamedRef.current);
+            if (filesRef.current) {
+              setSummary((s) => s || { files: filesRef.current.files.length, ...filesRef.current });
+              setStage("done");
+              setState("done");
+              setTiming({ client: (performance.now() - startedAt.current) / 1000 });
+              finished = true;
+            }
+          }
           if (type === "done" && !finished) setStage("done");
         }
         if (done) break;
+      }
+      if (!finished && streamedRef.current) {
+        // Stream ended after prose arrived: the streamed text already finished it.
+        finished = true;
       }
       if (!finished) {
         // Diff + checks are already on screen; only the model part is missing.

@@ -32,9 +32,22 @@ Final live backend source commit: `9d4547f78f6aca71cf2fbd66ce77ddc20ff3ebb8`. Li
 
 Deployed backend commit `8d0ccbc2628eeda815d6fa4971773da5f768e6ca` caches lightweight workspace summaries separately from compressed source. Reimporting the same pinned commit reuses its unexpired snapshot. Opening a saved project reads the summary without decompressing the full source, and sends a gzip-compressed response when supported. Summary responses include an import-edge count; actual answer graphs still carry detected edges. First imports still download and index the source. The regression suite has 40 tests.
 
-## Latency patches (unapplied to the Space)
+## Answer latency patches
 
-`repository.py` now: memoises retrieval windows per loaded snapshot (they were rebuilt, and every file re-tokenised, on each `/ask`), keeps the free chat stream open with no read timeout, emits a `status` event as soon as the model connection is live, and never splits a `[S1]` citation across two stream deltas. Tests: `test_chunk_windows_are_memoised_per_snapshot_files`, `test_source_id_split_across_deltas_is_never_cut`, `test_retrieval_reuses_windows_for_follow_up_questions`. Frontend shows elapsed time to the first words so a slow free model is visible rather than a frozen panel.
+`repository.py` now keeps the cost of a follow-up question low instead of re-doing import work:
+
+- A two-snapshot LRU holds decompressed snapshots, and a freshly imported snapshot is remembered immediately. Follow-up questions no longer decompress and re-parse the whole JSON each time.
+- One retrieval index per snapshot (windows, term counts, path terms, declaration names, lengths) is reused, so `/ask` only scores instead of re-tokenising every indexed file.
+- Import edges are grouped once per snapshot for retrieval, evidence graphs and build plans, removing repeated full-edge scans.
+- The exact-identifier check (`Where is X implemented?`) narrows to candidate files through the token index instead of regex-scanning every file.
+- Upstream model deltas are coalesced into ~80 ms / 400-character SSE chunks; a `[S1]` citation is still never split across chunks.
+- The provider status check is cached for 60 seconds, and `/file` loads off the event loop.
+- `POST /api/repository/build/ping` lets the frontend detect the blueprint route without a doomed request.
+
+Tests: `test_chunk_windows_are_memoised_per_snapshot_files`, `test_source_id_split_across_deltas_is_never_cut`, `test_retrieval_reuses_windows_for_follow_up_questions`, `test_explicit_symbol_check_narrows_scan_without_false_missing`, `test_build_capability_probe_is_available`.
+
+The frontend now coalesces streamed tokens into one paint per ~40 ms, scrolls on a short trailing timer instead of every delta, caches opened source files, and lazy-loads the React Flow graph so the landing page does not download it. Build questions try the documented `/{id}/build` route, then `/build/{id}`, then fall back to the normal Ask route on older backends instead of stopping with a 404.
+
 
 The `/api/upload` (file) endpoint still exists in the Space; the frontend no longer calls it on the default route.
 
